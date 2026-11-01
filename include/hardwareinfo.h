@@ -36,12 +36,14 @@ HW_API void hw_free_string(char *p);
 HW_API char *hw_cpu_json(void);     /* brand, vendor, arch, cores, MHz, CPUID features */
 HW_API char *hw_os_json(void);      /* product, version, edition, build, computer name */
 HW_API char *hw_memory_json(void);  /* physical + pagefile totals/available, load */
+HW_API char *hw_ram_json(void);     /* RAM modules per slot from SMBIOS: capacity, speed, maker */
 HW_API char *hw_disks_json(void);   /* logical drives: type, label, filesystem, sizes */
-HW_API char *hw_gpus_json(void);    /* display adapters (mirroring drivers skipped) */
+HW_API char *hw_physical_disks_json(void); /* physical drives: model, serial, bus, media, size, SMART verdict */
+HW_API char *hw_gpus_json(void);    /* display adapters + DXGI memory/IDs, driver (mirroring skipped) */
 HW_API char *hw_monitors_json(void);/* monitors: name, size, primary */
 HW_API char *hw_network_json(void); /* adapters: name, MAC, type, state, IPs */
 HW_API char *hw_battery_json(void); /* present, AC, charging, percent */
-HW_API char *hw_board_json(void);   /* system + baseboard + BIOS identity */
+HW_API char *hw_board_json(void);   /* system + baseboard + BIOS identity, serials, UUID (SMBIOS) */
 
 /* Everything at once; failed sections appear as {"error": ...}. */
 HW_API char *hw_system_json(void);

@@ -1,7 +1,7 @@
 //! Windows-only CI proof: run every probe against the CI machine
 //! and validate the invariants that must hold on ANY real Windows
 //! box (CPU present with cores, memory > 0, at least one fixed disk,
-//! OS build > 0). On non-Windows this file is empty.
+//! OS build > 0, SMBIOS readable). On non-Windows this file is empty.
 #![cfg(windows)]
 
 use hardwareinfo::ffi::*;
@@ -40,10 +40,31 @@ fn probes_return_plausible_data() {
     assert!(disks.contains("\"letter\":\"C:\""), "disks: {disks}");
     assert!(disks.contains("\"total_bytes\":"), "{disks}");
 
+    // Every real box (CI agents included, which run elevated) has
+    // a PhysicalDrive0 whose descriptor + geometry answer.
+    let physical = take(hw_physical_disks_json());
+    assert!(physical.contains("\"index\":0"), "physical: {physical}");
+    assert!(physical.contains("\"size_bytes\":"), "{physical}");
+    assert!(!physical.contains("\"size_bytes\":0"), "size: {physical}");
+    assert!(physical.contains("\"health\":\""), "{physical}");
+
+    // SMBIOS is present on CI VMs; a module list may be short but
+    // populated modules report a real capacity.
+    let ram = take(hw_ram_json());
+    assert!(ram.starts_with('['), "{ram}");
+    if ram != "[]" {
+        assert!(ram.contains("\"capacity_bytes\":"), "{ram}");
+        assert!(!ram.contains("\"capacity_bytes\":0"), "ram: {ram}");
+    }
+
     // GPU/monitor/network/battery/board: shape only (a headless CI
     // agent may have a basic display driver and no battery).
     let gpus = take(hw_gpus_json());
     assert!(gpus.starts_with('['), "{gpus}");
+    if gpus != "[]" {
+        assert!(gpus.contains("\"driver_version\":"), "{gpus}");
+        assert!(gpus.contains("\"dedicated_video_memory_bytes\":"), "{gpus}");
+    }
     let monitors = take(hw_monitors_json());
     assert!(monitors.starts_with('['), "{monitors}");
     let net = take(hw_network_json());
@@ -53,13 +74,17 @@ fn probes_return_plausible_data() {
     assert!(battery.contains("\"present\":"), "{battery}");
     let board = take(hw_board_json());
     assert!(board.contains("\"bios_version\""), "{board}");
+    assert!(board.contains("\"system_uuid\""), "{board}");
 
     let system = take(hw_system_json());
     for key in [
         "\"cpu\"",
         "\"os\"",
         "\"memory\"",
+        "\"ram\"",
         "\"disks\"",
+        "\"physical_disks\"",
+        "\"gpus\"",
         "\"network\"",
         "\"board\"",
     ] {
