@@ -580,7 +580,10 @@ mod tests {
             ..Default::default()
         }];
         let j = gpus_json(&gpus);
-        assert!(j.contains("\"dedicated_video_memory_bytes\":8589934592"), "{j}");
+        assert!(
+            j.contains("\"dedicated_video_memory_bytes\":8589934592"),
+            "{j}"
+        );
         assert!(j.contains("\"driver_version\":\"32.0.1\""), "{j}");
     }
 
@@ -590,7 +593,7 @@ mod tests {
         // packed after the 36-byte header.
         let mut buf = vec![0u8; 256];
         buf[10] = 1; // removable
-        let mut put = |field: usize, off: usize, s: &str, buf: &mut Vec<u8>| {
+        let put = |field: usize, off: usize, s: &str, buf: &mut Vec<u8>| {
             buf[field..field + 4].copy_from_slice(&(off as u32).to_le_bytes());
             buf[off..off + s.len()].copy_from_slice(s.as_bytes());
         };

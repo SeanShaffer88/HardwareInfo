@@ -130,7 +130,9 @@ pub extern "C" fn hw_disks_json() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn hw_physical_disks_json() -> *mut c_char {
-    finish_str(guard(|| platform::physical_disks().map(|d| physical_disks_json(&d))))
+    finish_str(guard(|| {
+        platform::physical_disks().map(|d| physical_disks_json(&d))
+    }))
 }
 
 #[no_mangle]

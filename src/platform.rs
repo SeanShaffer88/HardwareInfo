@@ -769,7 +769,9 @@ mod win {
     fn driver_details(device_key: &str) -> (String, u64) {
         // EnumDisplayDevices reports the driver key in NT form
         // (\Registry\Machine\...); the rest is HKLM-relative.
-        let subkey = device_key.strip_prefix("\\Registry\\Machine\\").unwrap_or("");
+        let subkey = device_key
+            .strip_prefix("\\Registry\\Machine\\")
+            .unwrap_or("");
         if subkey.is_empty() {
             return (String::new(), 0);
         }
@@ -845,8 +847,7 @@ mod win {
 
     fn dxgi_adapters() -> Vec<DxgiAdapter> {
         let mut factory: *mut c_void = std::ptr::null_mut();
-        if unsafe { CreateDXGIFactory1(&IID_IDXGIFACTORY1, &mut factory) } < 0
-            || factory.is_null()
+        if unsafe { CreateDXGIFactory1(&IID_IDXGIFACTORY1, &mut factory) } < 0 || factory.is_null()
         {
             return Vec::new();
         }

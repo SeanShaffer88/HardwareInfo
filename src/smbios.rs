@@ -426,7 +426,11 @@ mod tests {
             0x78, 0x56, 0x34, 0x12, 0xBC, 0x9A, 0xF0, 0xDE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
             0x77, 0x88,
         ]);
-        table.extend(structure(1, sys, &["ACME", "RoadRunner 15", "Rev A", "SYS-42"]));
+        table.extend(structure(
+            1,
+            sys,
+            &["ACME", "RoadRunner 15", "Rev A", "SYS-42"],
+        ));
         let mut board = vec![0u8; 0x0F];
         board[0x04] = 1;
         board[0x05] = 2;
