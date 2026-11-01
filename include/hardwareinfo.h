@@ -39,13 +39,14 @@ HW_API char *hw_memory_json(void);  /* physical + pagefile totals/available, loa
 HW_API char *hw_ram_json(void);     /* RAM modules per slot from SMBIOS: capacity, speed, maker */
 HW_API char *hw_disks_json(void);   /* logical drives: type, label, filesystem, sizes */
 HW_API char *hw_physical_disks_json(void); /* physical drives: model, serial, bus, media, size, SMART verdict */
+HW_API char *hw_smart_json(void);   /* per drive: ATA SMART attributes or NVMe health log; source "none" if neither answers */
 HW_API char *hw_gpus_json(void);    /* display adapters + DXGI memory/IDs, driver (mirroring skipped) */
 HW_API char *hw_monitors_json(void);/* monitors: name, size, primary */
 HW_API char *hw_network_json(void); /* adapters: name, MAC, type, state, IPs */
 HW_API char *hw_battery_json(void); /* present, AC, charging, percent */
 HW_API char *hw_batteries_json(void); /* per battery: chemistry, designed vs full mWh, health %, cycles */
 HW_API char *hw_board_json(void);   /* system + baseboard + BIOS identity, serials, UUID (SMBIOS) */
-HW_API char *hw_platform_json(void); /* firmware type (UEFI/BIOS), Secure Boot, TPM presence/version */
+HW_API char *hw_platform_json(void); /* firmware type (UEFI/BIOS), Secure Boot enabled + capable (true/false/null), TPM */
 
 /* Everything at once; failed sections appear as {"error": ...}. */
 HW_API char *hw_system_json(void);

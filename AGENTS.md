@@ -6,8 +6,11 @@
 - Read-only is the product: no setters, no IOCTLs that mutate, ever.
   The storage IOCTLs used (QUERY_PROPERTY, GET_DRIVE_GEOMETRY_EX,
   GET_LENGTH_INFO, PREDICT_FAILURE) are queries — keep it that way.
-  PREDICT_FAILURE is a verdict, not full SMART; never present it as
-  more than ok / failure_predicted / unknown. Battery IOCTLs
+  PREDICT_FAILURE is a verdict; the SMART tables behind
+  hw_smart_json are receive/read queries only (ATA features
+  0xD0/0xD1 via SMART_RCV_DRIVE_DATA, NVMe log page 02h via the
+  protocol-specific query) — never send a SMART command that
+  changes drive state (no ENABLE/DISABLE, no offline tests). Battery IOCTLs
   (QUERY_TAG, QUERY_INFORMATION) are queries too — never touch
   BATTERY_SET_* levels.
 - SetupDi records are byte buffers with house cbSizes: 32 for both
@@ -39,6 +42,19 @@
   PhysicalDrive open order matters: GENERIC_READ (elevated) then
   zero-access fallback for the FILE_ANY_ACCESS queries; drives
   that don't open are skipped, never an error.
+- SMART parsing is pure in src/lib.rs: ATA records at offset 2,
+  30 x 12 bytes (threshold byte @slot+1 in the thresholds block),
+  raw is 48-bit; NVMe health-log counters are 128-bit (low 64
+  kept), temperature u16le Kelvin @1. Attribute names cover ONLY
+  the documented generic set in smart_attribute_name — unknown
+  ids stay blank, never guessed. smart_disks opens RW then R
+  then 0 (SMART paths historically want RW handles); the
+  commands stay read-only regardless. Secure Boot capability is
+  Some(true) when enabled, else the SecureBoot UEFI variable
+  under a just-for-the-call SE_SYSTEM_ENVIRONMENT enable —
+  AdjustTokenPrivileges "succeeds" without the privilege held,
+  so the ERROR_NOT_ALL_ASSIGNED (1300) check is load-bearing;
+  indeterminate stays None (JSON null), never a guess.
 - DXGI is hand-rolled COM: vtable slots EnumAdapters1 = 12
   (IDXGIFactory1) and GetDesc1 = 10 (IDXGIAdapter1), Release = 2;
   IID_IDXGIFactory1 is in platform.rs. Re-verify against dxgi.h

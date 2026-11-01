@@ -48,6 +48,14 @@ fn probes_return_plausible_data() {
     assert!(!physical.contains("\"size_bytes\":0"), "size: {physical}");
     assert!(physical.contains("\"health\":\""), "{physical}");
 
+    // Shape only: a CI VM's emulated drive may expose no
+    // SMART-style data at all (source "none" is a real answer).
+    let smart = take(hw_smart_json());
+    assert!(smart.starts_with('['), "{smart}");
+    if smart != "[]" {
+        assert!(smart.contains("\"source\":\""), "{smart}");
+    }
+
     // SMBIOS is present on CI VMs; a module list may be short but
     // populated modules report a real capacity.
     let ram = take(hw_ram_json());
@@ -88,6 +96,7 @@ fn probes_return_plausible_data() {
     let platform = take(hw_platform_json());
     assert!(platform.contains("\"firmware_type\":\""), "{platform}");
     assert!(platform.contains("\"secure_boot_enabled\":"), "{platform}");
+    assert!(platform.contains("\"secure_boot_capable\":"), "{platform}");
     assert!(platform.contains("\"tpm_present\":"), "{platform}");
 
     let system = take(hw_system_json());
@@ -98,6 +107,7 @@ fn probes_return_plausible_data() {
         "\"ram\"",
         "\"disks\"",
         "\"physical_disks\"",
+        "\"smart\"",
         "\"gpus\"",
         "\"network\"",
         "\"batteries\"",

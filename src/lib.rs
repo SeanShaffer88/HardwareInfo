@@ -13,9 +13,9 @@ pub mod ffi;
 pub mod platform;
 pub mod smbios;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 3;
+pub const VERSION_MINOR: u32 = 4;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/hardwareinfo.h).
@@ -181,6 +181,13 @@ pub struct PlatformInfo {
     /// UEFISecureBootEnabled from the SecureBoot\State registry key;
     /// false when the key is absent (legacy firmware).
     pub secure_boot_enabled: bool,
+    /// Whether the firmware exposes the SecureBoot UEFI variable
+    /// in the current boot (Some(false) on legacy BIOS, where the
+    /// firmware-variable call fails with ERROR_INVALID_FUNCTION).
+    /// None when it could not be determined — typically because
+    /// SE_SYSTEM_ENVIRONMENT was not grantable unelevated. In JSON
+    /// this is true / false / null.
+    pub secure_boot_capable: Option<bool>,
     /// A Trusted Platform Module device is present (Security
     /// devices setup class).
     pub tpm_present: bool,
@@ -205,6 +212,58 @@ pub struct BatteryHealth {
     /// -1 when either capacity is unknown.
     pub health_percent: i32,
     pub cycle_count: u32,
+}
+
+/// One ATA SMART attribute entry, values exactly as reported.
+/// Meanings (including how `raw` is packed) are vendor-specific
+/// beyond the small documented generic set behind `name`;
+/// `name` is empty for ids outside that set.
+#[derive(Debug, Default, Clone)]
+pub struct SmartAttribute {
+    pub id: u32,
+    pub name: String,
+    pub flags: u32,
+    pub value: u32,
+    pub worst: u32,
+    /// 0 when the thresholds table could not be read.
+    pub threshold: u32,
+    /// The 48-bit raw value, as one integer.
+    pub raw: u64,
+}
+
+/// The NVMe SMART / Health Information log (log identifier 02h),
+/// fields as reported. Count fields are the low 64 bits of the
+/// log's 128-bit integers.
+#[derive(Debug, Default, Clone)]
+pub struct NvmeHealth {
+    pub critical_warning: u32,
+    pub temperature_kelvin: u32,
+    /// temperature_kelvin - 273; 0 when no sensor value was reported.
+    pub temperature_celsius: i32,
+    pub available_spare_percent: u32,
+    pub available_spare_threshold_percent: u32,
+    pub percentage_used: u32,
+    /// In units of 500,960 bytes, per the NVMe specification.
+    pub data_units_read: u64,
+    pub data_units_written: u64,
+    pub power_cycles: u64,
+    pub power_on_hours: u64,
+    pub unsafe_shutdowns: u64,
+    pub media_errors: u64,
+    pub error_log_entries: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DiskSmart {
+    /// `\\.\PhysicalDriveN` index, matching PhysicalDiskInfo.
+    pub index: u32,
+    /// Bus token as in PhysicalDiskInfo (nvme / sata / ...).
+    pub interface: String,
+    /// "ata_smart" / "nvme_health_log" / "none" (no SMART-style
+    /// data answered for this drive).
+    pub source: String,
+    pub ata_attributes: Vec<SmartAttribute>,
+    pub nvme: Option<NvmeHealth>,
 }
 
 pub fn json_escape(s: &str) -> String {
@@ -405,10 +464,15 @@ impl BatteryInfo {
 
 impl PlatformInfo {
     pub fn to_json(&self) -> String {
+        let capable = match self.secure_boot_capable {
+            Some(value) => value.to_string(),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"firmware_type\":{},\"secure_boot_enabled\":{},\"tpm_present\":{},\"tpm_version\":{},\"tpm_device\":{}}}",
+            "{{\"firmware_type\":{},\"secure_boot_enabled\":{},\"secure_boot_capable\":{},\"tpm_present\":{},\"tpm_version\":{},\"tpm_device\":{}}}",
             q(&self.firmware_type),
             self.secure_boot_enabled,
+            capable,
             self.tpm_present,
             q(&self.tpm_version),
             q(&self.tpm_device)
@@ -430,6 +494,62 @@ pub fn batteries_json(batteries: &[BatteryHealth]) -> String {
                 b.full_charge_capacity_mwh,
                 b.health_percent,
                 b.cycle_count
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+fn nvme_health_json(health: &NvmeHealth) -> String {
+    format!(
+        "{{\"critical_warning\":{},\"temperature_kelvin\":{},\"temperature_celsius\":{},\"available_spare_percent\":{},\"available_spare_threshold_percent\":{},\"percentage_used\":{},\"data_units_read\":{},\"data_units_written\":{},\"power_cycles\":{},\"power_on_hours\":{},\"unsafe_shutdowns\":{},\"media_errors\":{},\"error_log_entries\":{}}}",
+        health.critical_warning,
+        health.temperature_kelvin,
+        health.temperature_celsius,
+        health.available_spare_percent,
+        health.available_spare_threshold_percent,
+        health.percentage_used,
+        health.data_units_read,
+        health.data_units_written,
+        health.power_cycles,
+        health.power_on_hours,
+        health.unsafe_shutdowns,
+        health.media_errors,
+        health.error_log_entries
+    )
+}
+
+pub fn disk_smart_json(disks: &[DiskSmart]) -> String {
+    let items: Vec<String> = disks
+        .iter()
+        .map(|d| {
+            let attrs: Vec<String> = d
+                .ata_attributes
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{{\"id\":{},\"name\":{},\"flags\":{},\"value\":{},\"worst\":{},\"threshold\":{},\"raw\":{}}}",
+                        a.id,
+                        q(&a.name),
+                        a.flags,
+                        a.value,
+                        a.worst,
+                        a.threshold,
+                        a.raw
+                    )
+                })
+                .collect();
+            let nvme = match &d.nvme {
+                Some(health) => nvme_health_json(health),
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"index\":{},\"interface\":{},\"source\":{},\"ata_attributes\":[{}],\"nvme\":{}}}",
+                d.index,
+                q(&d.interface),
+                q(&d.source),
+                attrs.join(","),
+                nvme
             )
         })
         .collect();
@@ -532,6 +652,147 @@ pub fn battery_health_percent(designed_mwh: u32, full_mwh: u32) -> i32 {
         return -1;
     }
     ((full_mwh as u64 * 100) / designed_mwh as u64) as i32
+}
+
+/// Map a GetFirmwareEnvironmentVariableW("SecureBoot", ...)
+/// outcome to capability. ERROR_INVALID_FUNCTION (1) is the
+/// documented answer on systems without UEFI firmware-variable
+/// support, and the SecureBoot variable is mandatory on
+/// Secure-Boot-capable UEFI firmware, so ERROR_ENVVAR_NOT_FOUND
+/// (203) also reads as "not capable in this boot". Anything else
+/// (privilege not held, access denied, ...) is honestly unknown.
+pub fn secure_boot_capability(succeeded: bool, last_error: u32) -> Option<bool> {
+    if succeeded {
+        return Some(true);
+    }
+    match last_error {
+        1 | 203 => Some(false),
+        _ => None,
+    }
+}
+
+// ---- pure SMART parsing ----
+
+/// Names for the small set of SMART attribute ids whose meaning
+/// is documented generically (ATA spec / vendor-common). Anything
+/// else stays unnamed rather than guessed.
+pub fn smart_attribute_name(id: u8) -> &'static str {
+    match id {
+        1 => "raw_read_error_rate",
+        2 => "throughput_performance",
+        3 => "spin_up_time",
+        4 => "start_stop_count",
+        5 => "reallocated_sectors",
+        7 => "seek_error_rate",
+        8 => "seek_time_performance",
+        9 => "power_on_hours",
+        10 => "spin_retry_count",
+        11 => "calibration_retry_count",
+        12 => "power_cycle_count",
+        183 => "sata_downshift_count",
+        184 => "end_to_end_error",
+        187 => "reported_uncorrectable_errors",
+        188 => "command_timeout",
+        190 => "airflow_temperature",
+        191 => "g_sense_error_rate",
+        192 => "power_off_retract_count",
+        193 => "load_cycle_count",
+        194 => "temperature",
+        195 => "hardware_ecc_recovered",
+        196 => "reallocation_event_count",
+        197 => "current_pending_sectors",
+        198 => "offline_uncorrectable_sectors",
+        199 => "udma_crc_error_count",
+        240 => "head_flying_hours",
+        241 => "total_lbas_written",
+        242 => "total_lbas_read",
+        _ => "",
+    }
+}
+
+/// Threshold byte per attribute id from the SMART thresholds
+/// block, whose entries mirror the attribute layout: starting at
+/// offset 2, up to 30 records of 12 bytes (id, threshold, then
+/// reserved). Id 0 marks an unused slot.
+fn smart_threshold(thresholds: &[u8], id: u8) -> u32 {
+    for slot in 0..30usize {
+        let off = 2 + slot * 12;
+        if off + 2 > thresholds.len() {
+            break;
+        }
+        if thresholds[off] == id {
+            return thresholds[off + 1] as u32;
+        }
+    }
+    0
+}
+
+/// Parse the 512-byte SMART READ DATA attribute block: a 2-byte
+/// revision followed by up to 30 attribute records of 12 bytes
+/// (id u8, status flags u16le, current value u8, worst u8, raw
+/// 48-bit little-endian, reserved u8). Slots with id 0 are
+/// unused and skipped. `thresholds`, when present, is the
+/// matching SMART READ THRESHOLDS block.
+pub fn parse_ata_smart_attributes(data: &[u8], thresholds: Option<&[u8]>) -> Vec<SmartAttribute> {
+    let mut out = Vec::new();
+    for slot in 0..30usize {
+        let off = 2 + slot * 12;
+        if off + 12 > data.len() {
+            break;
+        }
+        let entry = &data[off..off + 12];
+        if entry[0] == 0 {
+            continue;
+        }
+        let mut raw = [0u8; 8];
+        raw[..6].copy_from_slice(&entry[5..11]);
+        out.push(SmartAttribute {
+            id: entry[0] as u32,
+            name: smart_attribute_name(entry[0]).to_string(),
+            flags: u16::from_le_bytes([entry[1], entry[2]]) as u32,
+            value: entry[3] as u32,
+            worst: entry[4] as u32,
+            threshold: thresholds.map_or(0, |t| smart_threshold(t, entry[0])),
+            raw: u64::from_le_bytes(raw),
+        });
+    }
+    out
+}
+
+fn le_u128_low64(buf: &[u8], off: usize) -> u64 {
+    match buf.get(off..off + 8) {
+        Some(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        None => 0,
+    }
+}
+
+/// Parse the NVMe SMART / Health Information log page (512
+/// bytes): critical warning @0, composite temperature u16le
+/// Kelvin @1, available spare % @3, spare threshold % @4,
+/// percentage used @5, then 128-bit counters (low 64 bits kept)
+/// for data units read @32 / written @48, power cycles @112,
+/// power-on hours @128, unsafe shutdowns @144, media errors
+/// @160, and error-log entries @176.
+pub fn parse_nvme_health_log(buf: &[u8]) -> Option<NvmeHealth> {
+    if buf.len() < 192 {
+        return None;
+    }
+    let kelvin = u16::from_le_bytes([buf[1], buf[2]]) as u32;
+    Some(NvmeHealth {
+        critical_warning: buf[0] as u32,
+        temperature_kelvin: kelvin,
+        temperature_celsius: if kelvin == 0 { 0 } else { kelvin as i32 - 273 },
+        available_spare_percent: buf[3] as u32,
+        available_spare_threshold_percent: buf[4] as u32,
+        percentage_used: buf[5] as u32,
+        data_units_read: le_u128_low64(buf, 32),
+        data_units_written: le_u128_low64(buf, 48),
+        power_cycles: le_u128_low64(buf, 112),
+        power_on_hours: le_u128_low64(buf, 128),
+        unsafe_shutdowns: le_u128_low64(buf, 144),
+        media_errors: le_u128_low64(buf, 160),
+        error_log_entries: le_u128_low64(buf, 176),
+    })
 }
 
 // ---- pure storage-descriptor parsing (STORAGE_DEVICE_DESCRIPTOR) ----
@@ -871,5 +1132,90 @@ mod tests {
         let j = batteries_json(&batteries);
         assert!(j.contains("\"health_percent\":85"), "{j}");
         assert!(j.contains("\"designed_capacity_mwh\":56000"), "{j}");
+    }
+
+    #[test]
+    fn secure_boot_capability_mapping() {
+        assert_eq!(secure_boot_capability(true, 0), Some(true));
+        assert_eq!(secure_boot_capability(false, 1), Some(false));
+        assert_eq!(secure_boot_capability(false, 203), Some(false));
+        assert_eq!(secure_boot_capability(false, 1314), None);
+        assert_eq!(secure_boot_capability(false, 5), None);
+    }
+
+    #[test]
+    fn smart_parsing() {
+        // Synthetic SMART block: id 9 power-on-hours raw 12345,
+        // id 194 temperature, one empty slot, one unnamed vendor id 230.
+        let mut data = [0u8; 512];
+        let mut put_attr = |slot: usize, id: u8, value: u8, worst: u8, raw: u64| {
+            let off = 2 + slot * 12;
+            data[off] = id;
+            data[off + 1..off + 3].copy_from_slice(&0x0023u16.to_le_bytes());
+            data[off + 3] = value;
+            data[off + 4] = worst;
+            data[off + 5..off + 11].copy_from_slice(&raw.to_le_bytes()[..6]);
+        };
+        put_attr(0, 9, 98, 98, 12345);
+        put_attr(2, 194, 70, 60, 30);
+        put_attr(3, 0xE6, 100, 100, 7);
+        let mut thresholds = [0u8; 512];
+        thresholds[2] = 9;
+        thresholds[3] = 1;
+        thresholds[14] = 194;
+        thresholds[15] = 45;
+        let attrs = parse_ata_smart_attributes(&data, Some(&thresholds));
+        assert_eq!(attrs.len(), 3, "{attrs:?}");
+        assert_eq!(attrs[0].id, 9);
+        assert_eq!(attrs[0].name, "power_on_hours");
+        assert_eq!(attrs[0].flags, 0x23);
+        assert_eq!(attrs[0].value, 98);
+        assert_eq!(attrs[0].raw, 12345);
+        assert_eq!(attrs[0].threshold, 1);
+        assert_eq!(attrs[1].name, "temperature");
+        assert_eq!(attrs[1].threshold, 45);
+        assert_eq!(attrs[2].name, "");
+        assert_eq!(attrs[2].threshold, 0);
+        // No thresholds block: thresholds read 0, entries intact.
+        assert_eq!(parse_ata_smart_attributes(&data, None).len(), 3);
+        // Truncated input yields what fits, never panics.
+        assert_eq!(parse_ata_smart_attributes(&data[..14], None).len(), 1);
+        assert!(parse_ata_smart_attributes(&[], None).is_empty());
+        // NVMe health log.
+        let mut log = [0u8; 512];
+        log[0] = 0;
+        log[1..3].copy_from_slice(&310u16.to_le_bytes()); // 37 C
+        log[3] = 100;
+        log[4] = 10;
+        log[5] = 3;
+        log[128..136].copy_from_slice(&8766u64.to_le_bytes());
+        log[160..168].copy_from_slice(&2u64.to_le_bytes());
+        let health = parse_nvme_health_log(&log).expect("nvme log");
+        assert_eq!(health.temperature_kelvin, 310);
+        assert_eq!(health.temperature_celsius, 37);
+        assert_eq!(health.percentage_used, 3);
+        assert_eq!(health.power_on_hours, 8766);
+        assert_eq!(health.media_errors, 2);
+        assert!(parse_nvme_health_log(&log[..64]).is_none());
+        // JSON shape: nulls where data did not answer.
+        let disks = vec![
+            DiskSmart {
+                index: 0,
+                interface: "nvme".into(),
+                source: "nvme_health_log".into(),
+                nvme: Some(health),
+                ..Default::default()
+            },
+            DiskSmart {
+                index: 1,
+                interface: "spaces".into(),
+                source: "none".into(),
+                ..Default::default()
+            },
+        ];
+        let j = disk_smart_json(&disks);
+        assert!(j.contains("\"percentage_used\":3"), "{j}");
+        assert!(j.contains("\"nvme\":null"), "{j}");
+        assert!(j.contains("\"source\":\"none\""), "{j}");
     }
 }

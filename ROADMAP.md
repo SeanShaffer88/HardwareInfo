@@ -1,21 +1,16 @@
 # HardwareInfo roadmap
 
-## Next
-
-- **Full SMART attribute tables**: raw attribute id/value/worst/
-  threshold per ATA drive plus the NVMe health log — v0.2 ships
-  the failure-prediction verdict only. Attribute meanings are
-  vendor-specific, so the design rule stays "raw reported values,
-  no invented labels beyond the documented generic set".
+v0.4 shipped the roadmap's two open items: full SMART tables
+(`hw_smart_json` — raw ATA attributes plus the NVMe health log,
+no invented labels beyond the documented generic set) and Secure
+Boot capability (`secure_boot_capable`, tri-state with an honest
+`null` when the firmware variable can't be read unelevated).
 
 ## Later
 
-- Temperatures/voltages are vendor-specific and often need a kernel
-  driver — likely to stay out; will document rather than fake.
-- Secure Boot *capability* (vs currently-enabled state, v0.3) needs
-  the firmware environment variable, which requires the
-  SE_SYSTEM_ENVIRONMENT privilege — only if it can degrade
-  honestly unelevated.
+- Temperatures/voltages beyond what a device itself reports are
+  vendor-specific and often need a kernel driver — likely to
+  stay out; will document rather than fake.
 
 ## Non-goals
 
