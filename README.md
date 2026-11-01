@@ -3,7 +3,8 @@
 A hardware inventory of the machine — CPU, OS, memory, RAM modules,
 logical + physical disks, GPUs, monitors, network adapters, battery
 (+ wear), motherboard/BIOS, platform readiness (TPM / Secure Boot /
-firmware mode) — as structured JSON behind one clean C ABI. Pure
+firmware mode), every present PnP device, audio endpoints, printers
+— as structured JSON behind one clean C ABI. Pure
 Rust, zero dependencies, hand-declared Win32 bindings. Library #8 in
 the Windows DLL Collection.
 
@@ -29,7 +30,10 @@ doesn't need — and one probe's failure never poisons the others.
 | `hw_batteries_json()` | Array of `{"name","manufacturer","chemistry","rechargeable","designed_capacity_mwh","full_charge_capacity_mwh","health_percent","cycle_count"}` per battery device. |
 | `hw_board_json()` | `{"system_manufacturer","system_product","board_manufacturer","board_product","bios_vendor","bios_version","bios_date","system_version","system_serial","board_version","board_serial","system_uuid"}` |
 | `hw_platform_json()` | `{"firmware_type","secure_boot_enabled","secure_boot_capable","tpm_present","tpm_version","tpm_device"}` (`secure_boot_capable` is `true`/`false`/`null`). |
-| `hw_system_json()` | All fourteen sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
+| `hw_devices_json()` | Array of `{"name","description","manufacturer","class","enumerator","location","instance_id","hardware_ids":[…],"vendor_id","device_id","problem_code","started"}` per present PnP device (`problem_code`/`started` are `null` when the devnode status can't be read). |
+| `hw_audio_json()` | Array of `{"name","direction","channels","manufacturer_id","product_id","driver_version"}` per wave audio device (`direction` is `output`/`input`). |
+| `hw_printers_json()` | Array of `{"name","driver","port","is_default","shared","status","jobs"}` per printer. |
+| `hw_system_json()` | All seventeen sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
 | `hw_version*`, `hw_last_error*`, `hw_free_string` | Version info, thread-local errors, disposal. |
 
 ## How the data is gathered
@@ -93,6 +97,24 @@ doesn't need — and one probe's failure never poisons the others.
   is honestly `null`, never a guess), and TPM presence/version from the
   Security devices setup class (the description Windows reports,
   e.g. "Trusted Platform Module 2.0").
+- **PnP devices**: every present device via SetupDi
+  (`DIGCF_PRESENT | DIGCF_ALLCLASSES`) — friendly name (or
+  description), manufacturer, setup class, enumerator, location,
+  instance ID, and the full hardware-ID list, with the vendor /
+  device ids lifted literally from the first hardware ID
+  (`VID_`/`PID_`, `VEN_`/`DEV_`; blank when the ID carries none).
+  Working state is the devnode view from `CM_Get_DevNode_Status`:
+  the `CM_PROB_*` problem code (0 = working properly) and the
+  `DN_STARTED` flag, both `null` when the status read fails.
+- **Audio**: wave output/input devices from winmm
+  (`waveOutGetDevCaps` / `waveInGetDevCaps`) — name, direction,
+  channels, manufacturer/product ids, driver version. The legacy
+  API caps names at 31 characters and reports no endpoint state
+  or default; those limits are inherited, not hidden.
+- **Printers**: local + connected queues from `EnumPrinters`
+  (level 2) — name, driver, port, shared flag, raw status
+  bitfield, queued-job count — with `is_default` matched against
+  `GetDefaultPrinter`.
 
 Struct layouts and linked-list offsets (SYSTEM_INFO, the adapter
 chain, SMBIOS structures, the storage descriptor) are used only
@@ -106,20 +128,22 @@ to missing fields, never to a guess.
 - Unit tests cover the JSON shapes and escaping, the pure parsers
   (synthetic SMBIOS tables, storage descriptor, seek-penalty and
   geometry buffers, DXGI name matching, BATTERY_INFORMATION and
-  the health-ratio math), and the off-Windows contract (every
-  probe is a precise `NOT_SUPPORTED`) — all runnable on any OS.
+  the health-ratio math, wave-caps buffers, hardware-ID tag
+  literals), and the off-Windows contract (every probe is a
+  precise `NOT_SUPPORTED`) — all runnable on any OS.
 - **CI (`tests/roundtrip.rs`, Windows)**: runs every probe against
   the CI machine and asserts the invariants that hold on any real
   Windows box — a named CPU with ≥1 logical processor, a Windows OS
   with a real build number, nonzero physical memory, a `C:` drive
   with capacity, a `PhysicalDrive0` with nonzero size, populated
   RAM modules with real capacity, well-formed arrays for
-  GPU/monitor/network/batteries, a platform section, and a system
-  document containing all sections.
+  GPU/monitor/network/batteries, a platform section, a non-empty
+  PnP device list, and a system document containing all sections.
 - Gate (WinDevKit `tools/gate.sh`): fmt, clippy on host **and**
   `x86_64-pc-windows-msvc` with `-D warnings`, full tests — green.
   All extern blocks carry their `#[link(name = "...")]` (kernel32,
-  user32, advapi32, iphlpapi, ntdll, dxgi, setupapi).
+  user32, advapi32, iphlpapi, ntdll, dxgi, setupapi, cfgmgr32,
+  winmm, winspool).
 
 Honest limits: reported values are what the devices report.
 The physical-disk `health` is the SMART failure-prediction
@@ -127,10 +151,14 @@ verdict only; SMART attribute meanings (and how `raw` is packed)
 are vendor-specific beyond the documented generic names;
 battery health is the capacities the battery itself reports;
 Secure Boot capability is `null` when it can't be determined
-without the privilege; and the TPM version is the one its
-Windows device description states. Temperatures/voltages beyond
+without the privilege; the TPM version is the one its Windows
+device description states; PnP vendor/device ids are only the
+tags literally present in the first hardware ID; wave-audio
+names inherit the legacy API's 31-character cap (and it reports
+no endpoint state/default); and printer `status` is the raw
+bitfield the spooler maintains. Temperatures/voltages beyond
 what a device itself reports (e.g. the NVMe log's temperature)
-are not in v0.4 (see ROADMAP).
+are not in v0.5 (see ROADMAP).
 
 ## License
 

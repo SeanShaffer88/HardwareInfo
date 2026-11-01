@@ -99,6 +99,27 @@ fn probes_return_plausible_data() {
     assert!(platform.contains("\"secure_boot_capable\":"), "{platform}");
     assert!(platform.contains("\"tpm_present\":"), "{platform}");
 
+    // PnP: any real Windows box has present devices (ACPI/HAL at
+    // a minimum). Audio/printers: shape only — a headless CI agent
+    // may have no sound card and only inbox printer queues.
+    let devices = take(hw_devices_json());
+    assert!(devices.starts_with('['), "{devices}");
+    assert!(devices != "[]", "no PnP devices reported: {devices}");
+    assert!(devices.contains("\"instance_id\":\""), "{devices}");
+    assert!(devices.contains("\"hardware_ids\":["), "{devices}");
+    assert!(devices.contains("\"problem_code\":"), "{devices}");
+    let audio = take(hw_audio_json());
+    assert!(audio.starts_with('['), "{audio}");
+    if audio != "[]" {
+        assert!(audio.contains("\"direction\":\""), "{audio}");
+    }
+    let printers = take(hw_printers_json());
+    assert!(printers.starts_with('['), "{printers}");
+    if printers != "[]" {
+        assert!(printers.contains("\"driver\":\""), "{printers}");
+        assert!(printers.contains("\"is_default\":"), "{printers}");
+    }
+
     let system = take(hw_system_json());
     for key in [
         "\"cpu\"",
@@ -113,6 +134,9 @@ fn probes_return_plausible_data() {
         "\"batteries\"",
         "\"board\"",
         "\"platform\"",
+        "\"devices\"",
+        "\"audio\"",
+        "\"printers\"",
     ] {
         assert!(system.contains(key), "system json missing {key}: {system}");
     }

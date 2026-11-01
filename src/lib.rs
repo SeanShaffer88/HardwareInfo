@@ -1,6 +1,7 @@
 //! HardwareInfo — a hardware inventory of the machine (CPU, OS,
 //! memory, RAM modules, logical + physical disks, GPUs, monitors,
-//! network adapters, battery, motherboard/BIOS) as structured JSON
+//! network adapters, battery, motherboard/BIOS, PnP devices,
+//! audio endpoints, printers) as structured JSON
 //! behind one clean C ABI, in pure Rust with zero dependencies and
 //! hand-declared Win32 bindings.
 //!
@@ -13,9 +14,9 @@ pub mod ffi;
 pub mod platform;
 pub mod smbios;
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 4;
+pub const VERSION_MINOR: u32 = 5;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/hardwareinfo.h).
@@ -264,6 +265,63 @@ pub struct DiskSmart {
     pub source: String,
     pub ata_attributes: Vec<SmartAttribute>,
     pub nvme: Option<NvmeHealth>,
+}
+
+/// One present Plug-and-Play device, identity and status exactly
+/// as SetupDi reports them. `vendor_id` / `device_id` are the ids
+/// literally carried in the first hardware ID ("0x046D" format),
+/// empty when the ID carries none.
+#[derive(Debug, Default, Clone)]
+pub struct PnpDevice {
+    /// Friendly name when Windows has one, else the description.
+    pub name: String,
+    pub description: String,
+    pub manufacturer: String,
+    /// Setup class name, e.g. "USB", "Net", "HIDClass".
+    pub class: String,
+    /// Bus enumerator name, e.g. "USB", "PCI", "ACPI".
+    pub enumerator: String,
+    /// Bus-reported location string; empty when not reported.
+    pub location: String,
+    /// Device instance ID (unique per device instance).
+    pub instance_id: String,
+    pub hardware_ids: Vec<String>,
+    pub vendor_id: String,
+    pub device_id: String,
+    /// CM_PROB_* problem code (0 = working properly); null when
+    /// the devnode status could not be read.
+    pub problem_code: Option<u32>,
+    /// The DN_STARTED devnode flag; null with `problem_code`.
+    pub started: Option<bool>,
+}
+
+/// One legacy wave audio device (winmm). Names come from the
+/// WAVEOUTCAPSW / WAVEINCAPSW szPname, which the API caps at 31
+/// characters; the API reports no endpoint state or default.
+#[derive(Debug, Default, Clone)]
+pub struct AudioDevice {
+    pub name: String,
+    /// "output" (render) / "input" (capture).
+    pub direction: String,
+    pub channels: u32,
+    /// Microsoft manufacturer / product identifiers (wMid / wPid).
+    pub manufacturer_id: u32,
+    pub product_id: u32,
+    pub driver_version: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PrinterInfo {
+    pub name: String,
+    pub driver: String,
+    pub port: String,
+    /// Name matches GetDefaultPrinterW.
+    pub is_default: bool,
+    /// PRINTER_ATTRIBUTE_SHARED.
+    pub shared: bool,
+    /// Raw PRINTER_STATUS_* bitfield as reported (0 = ready).
+    pub status: u32,
+    pub jobs: u32,
 }
 
 pub fn json_escape(s: &str) -> String {
@@ -550,6 +608,76 @@ pub fn disk_smart_json(disks: &[DiskSmart]) -> String {
                 q(&d.source),
                 attrs.join(","),
                 nvme
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+pub fn devices_json(devices: &[PnpDevice]) -> String {
+    let items: Vec<String> = devices
+        .iter()
+        .map(|d| {
+            let ids: Vec<String> = d.hardware_ids.iter().map(|s| q(s)).collect();
+            let problem = match d.problem_code {
+                Some(code) => code.to_string(),
+                None => "null".to_string(),
+            };
+            let started = match d.started {
+                Some(value) => value.to_string(),
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"name\":{},\"description\":{},\"manufacturer\":{},\"class\":{},\"enumerator\":{},\"location\":{},\"instance_id\":{},\"hardware_ids\":[{}],\"vendor_id\":{},\"device_id\":{},\"problem_code\":{},\"started\":{}}}",
+                q(&d.name),
+                q(&d.description),
+                q(&d.manufacturer),
+                q(&d.class),
+                q(&d.enumerator),
+                q(&d.location),
+                q(&d.instance_id),
+                ids.join(","),
+                q(&d.vendor_id),
+                q(&d.device_id),
+                problem,
+                started
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+pub fn audio_json(devices: &[AudioDevice]) -> String {
+    let items: Vec<String> = devices
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"name\":{},\"direction\":{},\"channels\":{},\"manufacturer_id\":{},\"product_id\":{},\"driver_version\":{}}}",
+                q(&a.name),
+                q(&a.direction),
+                a.channels,
+                a.manufacturer_id,
+                a.product_id,
+                q(&a.driver_version)
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+pub fn printers_json(printers: &[PrinterInfo]) -> String {
+    let items: Vec<String> = printers
+        .iter()
+        .map(|p| {
+            format!(
+                "{{\"name\":{},\"driver\":{},\"port\":{},\"is_default\":{},\"shared\":{},\"status\":{},\"jobs\":{}}}",
+                q(&p.name),
+                q(&p.driver),
+                q(&p.port),
+                p.is_default,
+                p.shared,
+                p.status,
+                p.jobs
             )
         })
         .collect();
@@ -928,6 +1056,82 @@ pub fn merge_dxgi_adapters(gpus: &mut [GpuInfo], adapters: &[DxgiAdapter]) {
     }
 }
 
+// ---- pure device-id / wave-caps parsing ----
+
+/// Extract the vendor/device ids literally carried in a hardware
+/// ID string — USB/HID `VID_046D&PID_C52B`, PCI
+/// `VEN_10DE&DEV_2684` — formatted "0x046D" like GpuInfo's DXGI
+/// ids. Each piece is "" when the ID carries no such tag; the
+/// tag must sit at the start or after a `\` or `&` separator,
+/// and be followed by exactly 4+ hex digits (the first 4 are
+/// taken). Nothing is inferred from anything else.
+pub fn device_ids_from_hardware_id(id: &str) -> (String, String) {
+    fn find_tag(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .enumerate()
+            .find(|(i, w)| {
+                w.eq_ignore_ascii_case(tag)
+                    && (*i == 0 || bytes[*i - 1] == b'\\' || bytes[*i - 1] == b'&')
+            })
+            .map(|(i, _)| i)
+    }
+    fn read_id(bytes: &[u8], tags: [&[u8; 4]; 2]) -> String {
+        for tag in tags {
+            if let Some(pos) = find_tag(bytes, tag) {
+                let hex = &bytes[pos + 4..];
+                if hex.len() >= 4 && hex[..4].iter().all(|b| b.is_ascii_hexdigit()) {
+                    let text = String::from_utf8_lossy(&hex[..4]).to_ascii_uppercase();
+                    return format!("0x{text}");
+                }
+            }
+        }
+        String::new()
+    }
+    let bytes = id.as_bytes();
+    (
+        read_id(bytes, [b"VID_", b"VEN_"]),
+        read_id(bytes, [b"PID_", b"DEV_"]),
+    )
+}
+
+/// The fields this library reports from WAVEOUTCAPSW /
+/// WAVEINCAPSW, decoded by parse_wave_caps.
+#[derive(Debug, Default, Clone)]
+pub struct WaveCaps {
+    pub name: String,
+    pub manufacturer_id: u32,
+    pub product_id: u32,
+    /// "major.minor" from the MMVERSION the driver reports.
+    pub driver_version: String,
+    pub channels: u32,
+}
+
+/// WAVEOUTCAPSW / WAVEINCAPSW shared layout (mmsystem.h):
+/// wMid u16@0, wPid u16@2, vDriverVersion MMVERSION u32@4
+/// (major in the high byte, minor in the low byte), szPname
+/// WCHAR[32]@8 (NUL-terminated, so at most 31 visible
+/// characters — an honest limit of the legacy wave API),
+/// dwFormats u32@72, wChannels u16@76.
+pub fn parse_wave_caps(buf: &[u8]) -> Option<WaveCaps> {
+    if buf.len() < 78 {
+        return None;
+    }
+    let version = le_u32(buf, 4)?;
+    let units: Vec<u16> = buf[8..72]
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    Some(WaveCaps {
+        name: String::from_utf16_lossy(&units),
+        manufacturer_id: u16::from_le_bytes([buf[0], buf[1]]) as u32,
+        product_id: u16::from_le_bytes([buf[2], buf[3]]) as u32,
+        driver_version: format!("{}.{}", (version >> 8) & 0xFF, version & 0xFF),
+        channels: u16::from_le_bytes([buf[76], buf[77]]) as u32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1421,112 @@ mod tests {
         assert!(j.contains("\"percentage_used\":3"), "{j}");
         assert!(j.contains("\"nvme\":null"), "{j}");
         assert!(j.contains("\"source\":\"none\""), "{j}");
+    }
+
+    #[test]
+    fn devices_audio_printers() {
+        // Hardware-id tag extraction is literal, per bus grammar.
+        assert_eq!(
+            device_ids_from_hardware_id("USB\\VID_046D&PID_C52B&REV_1203"),
+            ("0x046D".to_string(), "0xC52B".to_string())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("PCI\\VEN_10DE&DEV_2684&SUBSYS_510619DA&REV_A1"),
+            ("0x10DE".to_string(), "0x2684".to_string())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("HID\\VID_046D&PID_C52B&MI_00"),
+            ("0x046D".to_string(), "0xC52B".to_string())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("usb\\vid_046d&pid_c52b"),
+            ("0x046D".to_string(), "0xC52B".to_string())
+        );
+        // No tags / mid-token lookalikes / short or non-hex ids
+        // stay blank rather than guessed.
+        assert_eq!(
+            device_ids_from_hardware_id("ACPI\\PNP0303"),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("SOMEDEV_2684"),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("USB\\VID_04&PID_C52B"),
+            (String::new(), "0xC52B".to_string())
+        );
+        assert_eq!(
+            device_ids_from_hardware_id("USB\\VID_XXXX&PID_C52B"),
+            (String::new(), "0xC52B".to_string())
+        );
+
+        // Synthetic WAVEOUTCAPSW: mid 888, pid 77, version 3.10,
+        // stereo "Test Speakers".
+        let mut caps = vec![0u8; 84];
+        caps[0..2].copy_from_slice(&888u16.to_le_bytes());
+        caps[2..4].copy_from_slice(&77u16.to_le_bytes());
+        caps[4..8].copy_from_slice(&0x030Au32.to_le_bytes());
+        for (i, u) in "Test Speakers".encode_utf16().enumerate() {
+            caps[8 + i * 2..10 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+        caps[76..78].copy_from_slice(&2u16.to_le_bytes());
+        let parsed = parse_wave_caps(&caps).expect("wave caps");
+        assert_eq!(parsed.name, "Test Speakers");
+        assert_eq!(parsed.manufacturer_id, 888);
+        assert_eq!(parsed.product_id, 77);
+        assert_eq!(parsed.driver_version, "3.10");
+        assert_eq!(parsed.channels, 2);
+        // The 80-byte WAVEINCAPSW variant shares the prefix.
+        assert!(parse_wave_caps(&caps[..80]).is_some());
+        assert!(parse_wave_caps(&caps[..77]).is_none());
+
+        // JSON shapes, nulls where devnode status did not answer.
+        let devices = vec![
+            PnpDevice {
+                name: "Test Mouse".into(),
+                manufacturer: "ACME".into(),
+                class: "HIDClass".into(),
+                enumerator: "USB".into(),
+                hardware_ids: vec!["USB\\VID_046D&PID_C52B&REV_1203".into()],
+                vendor_id: "0x046D".into(),
+                device_id: "0xC52B".into(),
+                problem_code: Some(0),
+                started: Some(true),
+                ..Default::default()
+            },
+            PnpDevice {
+                name: "Mystery".into(),
+                ..Default::default()
+            },
+        ];
+        let j = devices_json(&devices);
+        assert!(j.contains("\"vendor_id\":\"0x046D\""), "{j}");
+        assert!(j.contains("\"problem_code\":0"), "{j}");
+        assert!(j.contains("\"problem_code\":null"), "{j}");
+        assert!(j.contains("\"started\":null"), "{j}");
+        assert!(j.contains("\"hardware_ids\":[\"USB\\\\VID_046D"), "{j}");
+        let audio = vec![AudioDevice {
+            name: "Test Speakers".into(),
+            direction: "output".into(),
+            channels: 2,
+            manufacturer_id: 888,
+            product_id: 77,
+            driver_version: "3.10".into(),
+        }];
+        let j = audio_json(&audio);
+        assert!(j.contains("\"direction\":\"output\""), "{j}");
+        assert!(j.contains("\"driver_version\":\"3.10\""), "{j}");
+        let printers = vec![PrinterInfo {
+            name: "Office".into(),
+            driver: "ACME PCL".into(),
+            port: "USB001".into(),
+            is_default: true,
+            jobs: 2,
+            ..Default::default()
+        }];
+        let j = printers_json(&printers);
+        assert!(j.contains("\"is_default\":true"), "{j}");
+        assert!(j.contains("\"jobs\":2"), "{j}");
     }
 }
