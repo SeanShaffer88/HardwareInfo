@@ -1872,7 +1872,7 @@ mod win {
         units
             .split(|&u| u == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf16_lossy(s).into_owned())
+            .map(String::from_utf16_lossy)
             .collect()
     }
 
@@ -1943,8 +1943,7 @@ mod win {
             let dev_inst = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
             let mut status: u32 = 0;
             let mut problem: u32 = 0;
-            let cm_rc =
-                unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) };
+            let cm_rc = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) };
             let (problem_code, started) = if cm_rc == 0 {
                 (Some(problem), Some(status & DN_STARTED != 0))
             } else {
@@ -1990,7 +1989,11 @@ mod win {
         } else {
             unsafe { waveInGetNumDevs() }
         };
-        let size = if output { WAVEOUTCAPS_SIZE } else { WAVEINCAPS_SIZE };
+        let size = if output {
+            WAVEOUTCAPS_SIZE
+        } else {
+            WAVEINCAPS_SIZE
+        };
         let direction = if output { "output" } else { "input" };
         for index in 0..count.min(64) {
             let mut buf = vec![0u8; size];
@@ -2110,7 +2113,12 @@ mod win {
             unsafe { std::ptr::read_unaligned(record.as_ptr().add(field * p) as *const usize) }
         };
         let u32_at = |record: &[u8], off: usize| -> u32 {
-            u32::from_le_bytes([record[off], record[off + 1], record[off + 2], record[off + 3]])
+            u32::from_le_bytes([
+                record[off],
+                record[off + 1],
+                record[off + 2],
+                record[off + 3],
+            ])
         };
         for i in 0..returned as usize {
             let start = i * record_size;

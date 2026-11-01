@@ -13,9 +13,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::platform;
 use crate::{
-    adapters_json, audio_json, batteries_json, devices_json, disk_smart_json, disks_json, gpus_json,
-    json_escape, monitors_json, physical_disks_json, printers_json, ram_json, ERR_INTERNAL, HW_OK,
-    VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
+    adapters_json, audio_json, batteries_json, devices_json, disk_smart_json, disks_json,
+    gpus_json, json_escape, monitors_json, physical_disks_json, printers_json, ram_json,
+    ERR_INTERNAL, HW_OK, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
 };
 
 thread_local! {
