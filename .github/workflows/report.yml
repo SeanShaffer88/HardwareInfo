@@ -17,6 +17,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           {
             echo '## Gate report (temporary workflow)'
             echo '```'
