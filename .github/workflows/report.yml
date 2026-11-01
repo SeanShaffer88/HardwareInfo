@@ -1,0 +1,39 @@
+name: report
+on:
+  pull_request:
+permissions:
+  pull-requests: write
+jobs:
+  report:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Run gate commands, capture output
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "=== cargo fmt --all -- --check ==="
+            cargo fmt --all -- --check 2>&1
+            echo "fmt exit: $?"
+            echo "=== cargo clippy --all-targets -- -D warnings ==="
+            cargo clippy --all-targets -- -D warnings 2>&1
+            echo "clippy exit: $?"
+            echo "=== cargo test --locked ==="
+            cargo test --locked 2>&1
+            echo "test exit: $?"
+            echo "=== cargo build --release --locked ==="
+            cargo build --release --locked 2>&1
+            echo "build exit: $?"
+          } > report.txt
+          exit 0
+      - name: Post report as PR comment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "## Gate report (temporary workflow)"; echo '```'; cat report.txt; echo '```'; } > comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
