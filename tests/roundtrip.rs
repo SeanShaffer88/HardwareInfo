@@ -87,10 +87,7 @@ fn probes_return_plausible_data() {
     assert!(board.contains("\"system_uuid\""), "{board}");
     let platform = take(hw_platform_json());
     assert!(platform.contains("\"firmware_type\":\""), "{platform}");
-    assert!(
-        platform.contains("\"secure_boot_enabled\":"),
-        "{platform}"
-    );
+    assert!(platform.contains("\"secure_boot_enabled\":"), "{platform}");
     assert!(platform.contains("\"tpm_present\":"), "{platform}");
 
     let system = take(hw_system_json());
