@@ -47,6 +47,9 @@ HW_API char *hw_battery_json(void); /* present, AC, charging, percent */
 HW_API char *hw_batteries_json(void); /* per battery: chemistry, designed vs full mWh, health %, cycles */
 HW_API char *hw_board_json(void);   /* system + baseboard + BIOS identity, serials, UUID (SMBIOS) */
 HW_API char *hw_platform_json(void); /* firmware type (UEFI/BIOS), Secure Boot enabled + capable (true/false/null), TPM */
+HW_API char *hw_devices_json(void); /* present PnP devices: name, manufacturer, class, enumerator, hardware IDs, vendor/device id, problem code (null if unread) */
+HW_API char *hw_audio_json(void);   /* wave audio devices: name (31-char API cap), direction, channels, driver */
+HW_API char *hw_printers_json(void);/* printers: name, driver, port, default/shared, status, queued jobs */
 
 /* Everything at once; failed sections appear as {"error": ...}. */
 HW_API char *hw_system_json(void);

@@ -13,9 +13,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::platform;
 use crate::{
-    adapters_json, batteries_json, disk_smart_json, disks_json, gpus_json, json_escape,
-    monitors_json, physical_disks_json, ram_json, ERR_INTERNAL, HW_OK, VERSION_MAJOR,
-    VERSION_MINOR, VERSION_PATCH,
+    adapters_json, audio_json, batteries_json, devices_json, disk_smart_json, disks_json,
+    gpus_json, json_escape, monitors_json, physical_disks_json, printers_json, ram_json,
+    ERR_INTERNAL, HW_OK, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
 };
 
 thread_local! {
@@ -68,7 +68,7 @@ fn finish_str(run: Result<Result<String, (i32, String)>, (i32, String)>) -> *mut
 
 #[no_mangle]
 pub extern "C" fn hw_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.4.0\0";
+    static VERSION_C: &[u8] = b"0.5.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 
@@ -183,6 +183,21 @@ pub extern "C" fn hw_platform_json() -> *mut c_char {
     finish_str(guard(|| platform::platform_info().map(|p| p.to_json())))
 }
 
+#[no_mangle]
+pub extern "C" fn hw_devices_json() -> *mut c_char {
+    finish_str(guard(|| platform::devices().map(|d| devices_json(&d))))
+}
+
+#[no_mangle]
+pub extern "C" fn hw_audio_json() -> *mut c_char {
+    finish_str(guard(|| platform::audio_devices().map(|a| audio_json(&a))))
+}
+
+#[no_mangle]
+pub extern "C" fn hw_printers_json() -> *mut c_char {
+    finish_str(guard(|| platform::printers().map(|p| printers_json(&p))))
+}
+
 /// All sections in one document; a failed section is
 /// {"error":"..."} in place of its data so the aggregate call only
 /// fails on non-Windows.
@@ -202,7 +217,7 @@ pub extern "C" fn hw_system_json() -> *mut c_char {
             return platform::not_supported("hardware probes");
         }
         Ok(format!(
-            "{{\"cpu\":{},\"os\":{},\"memory\":{},\"ram\":{},\"disks\":{},\"physical_disks\":{},\"smart\":{},\"gpus\":{},\"monitors\":{},\"network\":{},\"battery\":{},\"batteries\":{},\"board\":{},\"platform\":{}}}",
+            "{{\"cpu\":{},\"os\":{},\"memory\":{},\"ram\":{},\"disks\":{},\"physical_disks\":{},\"smart\":{},\"gpus\":{},\"monitors\":{},\"network\":{},\"battery\":{},\"batteries\":{},\"board\":{},\"platform\":{},\"devices\":{},\"audio\":{},\"printers\":{}}}",
             section(platform::cpu_info, |c| c.to_json()),
             section(platform::os_info, |o| o.to_json()),
             section(platform::memory_info, |m| m.to_json()),
@@ -217,6 +232,9 @@ pub extern "C" fn hw_system_json() -> *mut c_char {
             section(platform::batteries, |b| batteries_json(&b)),
             section(platform::board, |b| b.to_json()),
             section(platform::platform_info, |p| p.to_json()),
+            section(platform::devices, |d| devices_json(&d)),
+            section(platform::audio_devices, |a| audio_json(&a)),
+            section(platform::printers, |p| printers_json(&p)),
         ))
     }))
 }
@@ -242,6 +260,12 @@ mod tests {
             assert!(hw_batteries_json().is_null());
             assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
             assert!(hw_platform_json().is_null());
+            assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
+            assert!(hw_devices_json().is_null());
+            assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
+            assert!(hw_audio_json().is_null());
+            assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
+            assert!(hw_printers_json().is_null());
             assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
             assert!(hw_system_json().is_null());
         }

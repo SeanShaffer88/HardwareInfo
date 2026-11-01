@@ -29,12 +29,14 @@ mod win {
 
     use crate::smbios;
     use crate::{
-        battery_health_percent, bus_type_name, firmware_type_name, merge_dxgi_adapters,
-        parse_ata_smart_attributes, parse_battery_information, parse_disk_geometry_ex_size,
-        parse_nvme_health_log, parse_seek_penalty, parse_storage_device_descriptor,
-        secure_boot_capability, tpm_version_from_name, AdapterInfo, BatteryHealth, BatteryInfo,
-        BoardInfo, CResult, CpuInfo, DiskInfo, DiskSmart, DxgiAdapter, GpuInfo, MemoryInfo,
-        MonitorInfo, NvmeHealth, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule, ERR_PLATFORM,
+        battery_health_percent, bus_type_name, device_ids_from_hardware_id, firmware_type_name,
+        merge_dxgi_adapters, parse_ata_smart_attributes, parse_battery_information,
+        parse_disk_geometry_ex_size, parse_nvme_health_log, parse_seek_penalty,
+        parse_storage_device_descriptor, parse_wave_caps, secure_boot_capability,
+        tpm_version_from_name, AdapterInfo, AudioDevice, BatteryHealth, BatteryInfo, BoardInfo,
+        CResult, CpuInfo, DiskInfo, DiskSmart, DxgiAdapter, GpuInfo, MemoryInfo, MonitorInfo,
+        NvmeHealth, OsInfo, PhysicalDiskInfo, PlatformInfo, PnpDevice, PrinterInfo, RamModule,
+        ERR_PLATFORM,
     };
 
     // ---- registry + token privileges (advapi32) ----
@@ -1328,6 +1330,13 @@ mod win {
             dev_info: *mut c_void,
         ) -> i32;
         fn SetupDiEnumDeviceInfo(devs: isize, index: u32, data: *mut u8) -> i32;
+        fn SetupDiGetDeviceInstanceIdW(
+            devs: isize,
+            data: *mut u8,
+            buffer: *mut u16,
+            buffer_size: u32,
+            required: *mut u32,
+        ) -> i32;
         fn SetupDiGetDeviceRegistryPropertyW(
             devs: isize,
             data: *mut u8,
@@ -1341,6 +1350,7 @@ mod win {
     }
 
     const DIGCF_PRESENT: u32 = 0x2;
+    const DIGCF_ALLCLASSES: u32 = 0x4;
     const DIGCF_DEVICEINTERFACE: u32 = 0x10;
     // GUID_DEVINTERFACE_BATTERY {72631E54-78A4-11D0-BCF7-00AA00B7B32A}
     const GUID_DEVINTERFACE_BATTERY: Guid = Guid {
@@ -1803,12 +1813,340 @@ mod win {
         }
         Ok(info)
     }
+
+    // ---- PnP device inventory (setupapi + cfgmgr32) ----
+    #[link(name = "cfgmgr32")]
+    extern "system" {
+        fn CM_Get_DevNode_Status(
+            status: *mut u32,
+            problem: *mut u32,
+            dev_inst: u32,
+            flags: u32,
+        ) -> i32;
+    }
+    const DN_STARTED: u32 = 0x0000_0008;
+
+    /// One SetupDi device-registry property as raw bytes
+    /// (two-call sizing, capped); empty when absent.
+    fn device_registry_bytes(devs: isize, data: *mut u8, property: u32) -> Vec<u8> {
+        let mut required: u32 = 0;
+        unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                devs,
+                data,
+                property,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            )
+        };
+        if required == 0 || required > 65_536 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; required as usize];
+        let ok = unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                devs,
+                data,
+                property,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                required,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            Vec::new()
+        } else {
+            buf
+        }
+    }
+
+    /// REG_MULTI_SZ bytes (UTF-16LE, NUL-separated) as strings.
+    fn multi_sz_from_bytes(buf: &[u8]) -> Vec<String> {
+        let units: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        units
+            .split(|&u| u == 0)
+            .filter(|s| !s.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    fn device_instance_id(devs: isize, data: *mut u8) -> String {
+        let mut buf = vec![0u16; 512];
+        let mut required: u32 = 0;
+        let ok = unsafe {
+            SetupDiGetDeviceInstanceIdW(
+                devs,
+                data,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut required,
+            )
+        };
+        if ok == 0 {
+            return String::new();
+        }
+        let units: Vec<u16> = buf.iter().copied().take_while(|&u| u != 0).collect();
+        String::from_utf16_lossy(&units)
+    }
+
+    pub fn devices() -> CResult<Vec<PnpDevice>> {
+        const SPDRP_DEVICEDESC: u32 = 0x00;
+        const SPDRP_HARDWAREID: u32 = 0x01;
+        const SPDRP_CLASS: u32 = 0x07;
+        const SPDRP_MFG: u32 = 0x0B;
+        const SPDRP_FRIENDLYNAME: u32 = 0x0C;
+        const SPDRP_LOCATION_INFORMATION: u32 = 0x0D;
+        const SPDRP_ENUMERATOR_NAME: u32 = 0x16;
+        let mut out = Vec::new();
+        let devs = unsafe {
+            SetupDiGetClassDevsW(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_PRESENT | DIGCF_ALLCLASSES,
+            )
+        };
+        if devs == -1 {
+            return Ok(out);
+        }
+        let string_prop = |data: *mut u8, property: u32| -> String {
+            wide_string_from_bytes(&device_registry_bytes(devs, data, property))
+        };
+        let mut index = 0u32;
+        loop {
+            let mut data = [0u8; 32];
+            data[0..4].copy_from_slice(&32u32.to_le_bytes());
+            if unsafe { SetupDiEnumDeviceInfo(devs, index, data.as_mut_ptr()) } == 0 {
+                break;
+            }
+            index += 1;
+            let description = string_prop(data.as_mut_ptr(), SPDRP_DEVICEDESC);
+            let friendly = string_prop(data.as_mut_ptr(), SPDRP_FRIENDLYNAME);
+            let name = if friendly.is_empty() {
+                description.clone()
+            } else {
+                friendly
+            };
+            let id_bytes = device_registry_bytes(devs, data.as_mut_ptr(), SPDRP_HARDWAREID);
+            let hardware_ids = multi_sz_from_bytes(&id_bytes);
+            let (vendor_id, device_id) = match hardware_ids.first() {
+                Some(id) => device_ids_from_hardware_id(id),
+                None => (String::new(), String::new()),
+            };
+            // DevInst is the u32 at offset 20 (cbSize + ClassGuid).
+            let dev_inst = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+            let mut status: u32 = 0;
+            let mut problem: u32 = 0;
+            let cm_rc = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) };
+            let (problem_code, started) = if cm_rc == 0 {
+                (Some(problem), Some(status & DN_STARTED != 0))
+            } else {
+                (None, None)
+            };
+            out.push(PnpDevice {
+                name,
+                description,
+                manufacturer: string_prop(data.as_mut_ptr(), SPDRP_MFG),
+                class: string_prop(data.as_mut_ptr(), SPDRP_CLASS),
+                enumerator: string_prop(data.as_mut_ptr(), SPDRP_ENUMERATOR_NAME),
+                location: string_prop(data.as_mut_ptr(), SPDRP_LOCATION_INFORMATION),
+                instance_id: device_instance_id(devs, data.as_mut_ptr()),
+                hardware_ids,
+                vendor_id,
+                device_id,
+                problem_code,
+                started,
+            });
+            if index > 4096 {
+                break;
+            }
+        }
+        unsafe { SetupDiDestroyDeviceInfoList(devs) };
+        Ok(out)
+    }
+
+    // ---- audio endpoints (winmm, legacy wave API) ----
+    #[link(name = "winmm")]
+    extern "system" {
+        fn waveOutGetNumDevs() -> u32;
+        fn waveInGetNumDevs() -> u32;
+        fn waveOutGetDevCapsW(device: usize, caps: *mut u8, size: u32) -> u32;
+        fn waveInGetDevCapsW(device: usize, caps: *mut u8, size: u32) -> u32;
+    }
+
+    fn wave_devices(output: bool) -> Vec<AudioDevice> {
+        const WAVEOUTCAPS_SIZE: usize = 84;
+        const WAVEINCAPS_SIZE: usize = 80;
+        let mut out = Vec::new();
+        let count = if output {
+            unsafe { waveOutGetNumDevs() }
+        } else {
+            unsafe { waveInGetNumDevs() }
+        };
+        let size = if output {
+            WAVEOUTCAPS_SIZE
+        } else {
+            WAVEINCAPS_SIZE
+        };
+        let direction = if output { "output" } else { "input" };
+        for index in 0..count.min(64) {
+            let mut buf = vec![0u8; size];
+            let rc = if output {
+                unsafe { waveOutGetDevCapsW(index as usize, buf.as_mut_ptr(), size as u32) }
+            } else {
+                unsafe { waveInGetDevCapsW(index as usize, buf.as_mut_ptr(), size as u32) }
+            };
+            if rc != 0 {
+                continue;
+            }
+            if let Some(caps) = parse_wave_caps(&buf) {
+                out.push(AudioDevice {
+                    name: caps.name,
+                    direction: direction.to_string(),
+                    channels: caps.channels,
+                    manufacturer_id: caps.manufacturer_id,
+                    product_id: caps.product_id,
+                    driver_version: caps.driver_version,
+                });
+            }
+        }
+        out
+    }
+
+    pub fn audio_devices() -> CResult<Vec<AudioDevice>> {
+        let mut out = wave_devices(true);
+        out.extend(wave_devices(false));
+        Ok(out)
+    }
+
+    // ---- printers (winspool) ----
+    #[link(name = "winspool")]
+    extern "system" {
+        fn EnumPrintersW(
+            flags: u32,
+            name: *mut u16,
+            level: u32,
+            printers: *mut u8,
+            buf_size: u32,
+            needed: *mut u32,
+            returned: *mut u32,
+        ) -> i32;
+        fn GetDefaultPrinterW(name: *mut u16, size: *mut u32) -> i32;
+    }
+
+    fn default_printer_name() -> String {
+        let mut size: u32 = 0;
+        unsafe { GetDefaultPrinterW(std::ptr::null_mut(), &mut size) };
+        if size == 0 || size > 8192 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; size as usize];
+        if unsafe { GetDefaultPrinterW(buf.as_mut_ptr(), &mut size) } == 0 {
+            return String::new();
+        }
+        let units: Vec<u16> = buf.iter().copied().take_while(|&u| u != 0).collect();
+        String::from_utf16_lossy(&units)
+    }
+
+    /// A NUL-terminated wide string packed inside `buf` at the
+    /// absolute address `ptr` (how EnumPrinters level-2 records
+    /// reference their strings); empty for null / out-of-buffer.
+    fn packed_wide_string(buf: &[u8], ptr: usize) -> String {
+        let base = buf.as_ptr() as usize;
+        if ptr < base || ptr >= base + buf.len() {
+            return String::new();
+        }
+        wide_string_from_bytes(&buf[ptr - base..])
+    }
+
+    pub fn printers() -> CResult<Vec<PrinterInfo>> {
+        const PRINTER_ENUM_LOCAL: u32 = 0x2;
+        const PRINTER_ENUM_CONNECTIONS: u32 = 0x4;
+        const PRINTER_ATTRIBUTE_SHARED: u32 = 0x8;
+        let mut out = Vec::new();
+        let mut needed: u32 = 0;
+        let mut returned: u32 = 0;
+        unsafe {
+            EnumPrintersW(
+                PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+                std::ptr::null_mut(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+                &mut returned,
+            )
+        };
+        if needed == 0 || needed > 16 * 1024 * 1024 {
+            return Ok(out);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = unsafe {
+            EnumPrintersW(
+                PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+                std::ptr::null_mut(),
+                2,
+                buf.as_mut_ptr(),
+                needed,
+                &mut needed,
+                &mut returned,
+            )
+        };
+        if ok == 0 {
+            return Ok(out);
+        }
+        let default_name = default_printer_name();
+        // PRINTER_INFO_2W: 13 pointer fields (name @1, port @3,
+        // driver @4), then Attributes / Priority / DefaultPriority
+        // / StartTime / UntilTime / Status / cJobs / AveragePPM as
+        // u32s. Offsets are pointer-sized, so the layout holds on
+        // 32- and 64-bit alike.
+        let p = std::mem::size_of::<usize>();
+        let record_size = 13 * p + 8 * 4;
+        let ptr_at = |record: &[u8], field: usize| -> usize {
+            unsafe { std::ptr::read_unaligned(record.as_ptr().add(field * p) as *const usize) }
+        };
+        let u32_at = |record: &[u8], off: usize| -> u32 {
+            u32::from_le_bytes([
+                record[off],
+                record[off + 1],
+                record[off + 2],
+                record[off + 3],
+            ])
+        };
+        for i in 0..returned as usize {
+            let start = i * record_size;
+            let record = match buf.get(start..start + record_size) {
+                Some(r) => r,
+                None => break,
+            };
+            let name = packed_wide_string(&buf, ptr_at(record, 1));
+            let is_default = !default_name.is_empty() && name == default_name;
+            out.push(PrinterInfo {
+                name,
+                driver: packed_wide_string(&buf, ptr_at(record, 4)),
+                port: packed_wide_string(&buf, ptr_at(record, 3)),
+                is_default,
+                shared: u32_at(record, 13 * p) & PRINTER_ATTRIBUTE_SHARED != 0,
+                status: u32_at(record, 13 * p + 20),
+                jobs: u32_at(record, 13 * p + 24),
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(not(windows))]
 use crate::{
-    AdapterInfo, BatteryHealth, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, DiskSmart, GpuInfo,
-    MemoryInfo, MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
+    AdapterInfo, AudioDevice, BatteryHealth, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, DiskSmart,
+    GpuInfo, MemoryInfo, MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, PnpDevice,
+    PrinterInfo, RamModule,
 };
 
 #[cfg(not(windows))]
@@ -1866,4 +2204,16 @@ pub fn batteries() -> CResult<Vec<BatteryHealth>> {
 #[cfg(not(windows))]
 pub fn platform_info() -> CResult<PlatformInfo> {
     not_supported("platform_info")
+}
+#[cfg(not(windows))]
+pub fn devices() -> CResult<Vec<PnpDevice>> {
+    not_supported("devices")
+}
+#[cfg(not(windows))]
+pub fn audio_devices() -> CResult<Vec<AudioDevice>> {
+    not_supported("audio_devices")
+}
+#[cfg(not(windows))]
+pub fn printers() -> CResult<Vec<PrinterInfo>> {
+    not_supported("printers")
 }

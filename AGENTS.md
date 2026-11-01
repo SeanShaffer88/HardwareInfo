@@ -1,7 +1,8 @@
 # HardwareInfo — agent notes
 
 - Every extern block MUST carry #[link(name = "...")] (kernel32 /
-  user32 / advapi32 / iphlpapi / ntdll / dxgi / setupapi). Clippy and
+  user32 / advapi32 / iphlpapi / ntdll / dxgi / setupapi / cfgmgr32 /
+  winmm / winspool). Clippy and
   check cannot catch a missing one; CI's Windows link can.
 - Read-only is the product: no setters, no IOCTLs that mutate, ever.
   The storage IOCTLs used (QUERY_PROPERTY, GET_DRIVE_GEOMETRY_EX,
@@ -16,8 +17,14 @@
 - SetupDi records are byte buffers with house cbSizes: 32 for both
   SP_DEVICE_INTERFACE_DATA and SP_DEVINFO_DATA on 64-bit, and 8 for
   the W interface-detail record (path WCHARs at offset 4). SetupDi
-  serves both battery enumeration (GUID_DEVINTERFACE_BATTERY) and
-  TPM presence (Security devices class). TPM version comes ONLY
+  serves battery enumeration (GUID_DEVINTERFACE_BATTERY), TPM
+  presence (Security devices class), and the full PnP inventory
+  (hw_devices_json: DIGCF_ALLCLASSES + per-property two-call
+  reads; DevInst is the u32 @20 in SP_DEVINFO_DATA, fed to
+  CM_Get_DevNode_Status for problem_code/DN_STARTED — null when
+  that fails, never a guess). Vendor/device ids come ONLY from
+  VID_/VEN_ + PID_/DEV_ tags literally in the first hardware ID
+  (device_ids_from_hardware_id, pure in src/lib.rs). TPM version comes ONLY
   from the reported device description text — don't infer it.
   BATTERY_INFORMATION offsets (Technology @4, Chemistry @8,
   Designed @12, Full @16, Cycles @32; 0xFFFFFFFF = unknown) and
@@ -55,6 +62,15 @@
   AdjustTokenPrivileges "succeeds" without the privilege held,
   so the ERROR_NOT_ALL_ASSIGNED (1300) check is load-bearing;
   indeterminate stays None (JSON null), never a guess.
+- Wave caps parsing is pure in src/lib.rs (shared WAVEOUTCAPSW /
+  WAVEINCAPSW prefix: wMid @0, wPid @2, version @4 high/low byte
+  major.minor, szPname WCHAR[32] @8, wChannels @76) — names are
+  capped at 31 chars by the API itself; don't "upgrade" them from
+  registry guesses. PRINTER_INFO_2 is walked with pointer-sized
+  offsets (13 pointer fields, then 8 u32s: Attributes @+0,
+  Status @+20, cJobs @+24); its strings are absolute pointers
+  into the EnumPrinters buffer and are bounds-checked back into
+  that buffer (packed_wide_string) before any read.
 - DXGI is hand-rolled COM: vtable slots EnumAdapters1 = 12
   (IDXGIFactory1) and GetDesc1 = 10 (IDXGIAdapter1), Release = 2;
   IID_IDXGIFactory1 is in platform.rs. Re-verify against dxgi.h
