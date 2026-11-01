@@ -1,13 +1,24 @@
 # HardwareInfo — agent notes
 
 - Every extern block MUST carry #[link(name = "...")] (kernel32 /
-  user32 / advapi32 / iphlpapi / ntdll / dxgi). Clippy and check cannot
-  catch a missing one; CI's Windows link can.
+  user32 / advapi32 / iphlpapi / ntdll / dxgi / setupapi). Clippy and
+  check cannot catch a missing one; CI's Windows link can.
 - Read-only is the product: no setters, no IOCTLs that mutate, ever.
   The storage IOCTLs used (QUERY_PROPERTY, GET_DRIVE_GEOMETRY_EX,
   GET_LENGTH_INFO, PREDICT_FAILURE) are queries — keep it that way.
   PREDICT_FAILURE is a verdict, not full SMART; never present it as
-  more than ok / failure_predicted / unknown.
+  more than ok / failure_predicted / unknown. Battery IOCTLs
+  (QUERY_TAG, QUERY_INFORMATION) are queries too — never touch
+  BATTERY_SET_* levels.
+- SetupDi records are byte buffers with house cbSizes: 32 for both
+  SP_DEVICE_INTERFACE_DATA and SP_DEVINFO_DATA on 64-bit, and 8 for
+  the W interface-detail record (path WCHARs at offset 4). SetupDi
+  serves both battery enumeration (GUID_DEVINTERFACE_BATTERY) and
+  TPM presence (Security devices class). TPM version comes ONLY
+  from the reported device description text — don't infer it.
+  BATTERY_INFORMATION offsets (Technology @4, Chemistry @8,
+  Designed @12, Full @16, Cycles @32; 0xFFFFFFFF = unknown) and
+  the health ratio are pure in src/lib.rs — keep them testable.
 - Adapter-chain parsing uses documented x64/ARM64 offsets into
   IP_ADAPTER_ADDRESSES (FriendlyName 72, Description 64, MAC at 80
   len 88, IfType 100, OperStatus 104; unicast Address sockaddr at

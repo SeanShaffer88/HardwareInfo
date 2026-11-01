@@ -57,8 +57,9 @@ fn probes_return_plausible_data() {
         assert!(!ram.contains("\"capacity_bytes\":0"), "ram: {ram}");
     }
 
-    // GPU/monitor/network/battery/board: shape only (a headless CI
-    // agent may have a basic display driver and no battery).
+    // GPU/monitor/network/battery/board/platform: shape only (a
+    // headless CI agent may have a basic display driver, no
+    // battery, and firmware settings we don't control).
     let gpus = take(hw_gpus_json());
     assert!(gpus.starts_with('['), "{gpus}");
     if gpus != "[]" {
@@ -72,9 +73,22 @@ fn probes_return_plausible_data() {
     assert!(net.contains("\"mac\""), "{net}");
     let battery = take(hw_battery_json());
     assert!(battery.contains("\"present\":"), "{battery}");
+    let batteries = take(hw_batteries_json());
+    assert!(batteries.starts_with('['), "{batteries}");
+    if batteries != "[]" {
+        assert!(batteries.contains("\"health_percent\":"), "{batteries}");
+        assert!(
+            batteries.contains("\"designed_capacity_mwh\":"),
+            "{batteries}"
+        );
+    }
     let board = take(hw_board_json());
     assert!(board.contains("\"bios_version\""), "{board}");
     assert!(board.contains("\"system_uuid\""), "{board}");
+    let platform = take(hw_platform_json());
+    assert!(platform.contains("\"firmware_type\":\""), "{platform}");
+    assert!(platform.contains("\"secure_boot_enabled\":"), "{platform}");
+    assert!(platform.contains("\"tpm_present\":"), "{platform}");
 
     let system = take(hw_system_json());
     for key in [
@@ -86,7 +100,9 @@ fn probes_return_plausible_data() {
         "\"physical_disks\"",
         "\"gpus\"",
         "\"network\"",
+        "\"batteries\"",
         "\"board\"",
+        "\"platform\"",
     ] {
         assert!(system.contains(key), "system json missing {key}: {system}");
     }
