@@ -30,13 +30,15 @@ mod win {
     use crate::smbios;
     use crate::{
         battery_health_percent, bus_type_name, firmware_type_name, merge_dxgi_adapters,
-        parse_battery_information, parse_disk_geometry_ex_size, parse_seek_penalty,
-        parse_storage_device_descriptor, tpm_version_from_name, AdapterInfo, BatteryHealth,
-        BatteryInfo, BoardInfo, CResult, CpuInfo, DiskInfo, DxgiAdapter, GpuInfo, MemoryInfo,
-        MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule, ERR_PLATFORM,
+        parse_ata_smart_attributes, parse_battery_information, parse_disk_geometry_ex_size,
+        parse_nvme_health_log, parse_seek_penalty, parse_storage_device_descriptor,
+        secure_boot_capability, tpm_version_from_name, AdapterInfo, BatteryHealth, BatteryInfo,
+        BoardInfo, CResult, CpuInfo, DiskInfo, DiskSmart, DxgiAdapter, GpuInfo, MemoryInfo,
+        MonitorInfo, NvmeHealth, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
+        ERR_PLATFORM,
     };
 
-    // ---- registry (advapi32) ----
+    // ---- registry + token privileges (advapi32) ----
     #[link(name = "advapi32")]
     extern "system" {
         fn RegOpenKeyExW(
@@ -55,6 +57,16 @@ mod win {
             size: *mut u32,
         ) -> i32;
         fn RegCloseKey(key: isize) -> i32;
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut u8) -> i32;
+        fn AdjustTokenPrivileges(
+            token: isize,
+            disable_all: i32,
+            new_state: *const u8,
+            buffer_length: u32,
+            previous_state: *mut u8,
+            return_length: *mut u32,
+        ) -> i32;
     }
     const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
     const KEY_READ: u32 = 0x0002_0019;
@@ -190,6 +202,13 @@ mod win {
         ) -> i32;
         fn GetSystemPowerStatus(status: *mut PowerStatus) -> i32;
         fn GetFirmwareType(firmware_type: *mut u32) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn GetFirmwareEnvironmentVariableW(
+            name: *const u16,
+            guid: *const u16,
+            value: *mut c_void,
+            size: u32,
+        ) -> u32;
         fn GetSystemFirmwareTable(sig: u32, id: u32, buf: *mut c_void, size: u32) -> u32;
         fn CreateFileW(
             name: *const u16,
@@ -675,6 +694,183 @@ mod win {
                 continue;
             }
             let disk = probe_physical_disk(handle, index);
+            unsafe { CloseHandle(handle) };
+            if let Some(disk) = disk {
+                out.push(disk);
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- SMART detail (same storage handles, read-only commands) ----
+    // ATA: SMART READ DATA / READ THRESHOLDS via the legacy
+    // SMART_RCV_DRIVE_DATA command path — receive-only by name and
+    // by design. NVMe: the protocol-specific storage query asking
+    // for log page 02h. Neither can write to the drive.
+    const SMART_RCV_DRIVE_DATA: u32 = 0x0007_C088;
+    const STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY: u32 = 50;
+
+    fn ata_smart_read(handle: isize, index: u32, feature: u8) -> Option<Vec<u8>> {
+        // SENDCMDINPARAMS (32 bytes before the buffer byte):
+        // cBufferSize u32 @0, then the task-file registers as
+        // single bytes @4: Features, SectorCount, SectorNumber,
+        // CylLow, CylHigh, DriveHead, Command, Reserved, then
+        // bDriveNumber @12. SMART commands require the signature
+        // CylLow/CylHigh 0x4F/0xC2 and command 0xB0.
+        let mut input = [0u8; 32];
+        input[0..4].copy_from_slice(&512u32.to_le_bytes());
+        input[4] = feature;
+        input[5] = 1;
+        input[6] = 1;
+        input[7] = 0x4F;
+        input[8] = 0xC2;
+        input[9] = 0xA0;
+        input[10] = 0xB0;
+        input[12] = index as u8;
+        // SENDCMDOUTPARAMS: cBufferSize u32, DRIVERSTATUS (error
+        // byte first) @4, reserved to @16, then the 512 data bytes.
+        let mut out = vec![0u8; 528];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                SMART_RCV_DRIVE_DATA,
+                input.as_ptr() as *const c_void,
+                input.len() as u32,
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 528 || out[4] != 0 {
+            return None;
+        }
+        Some(out[16..528].to_vec())
+    }
+
+    fn nvme_health(handle: isize) -> Option<NvmeHealth> {
+        // STORAGE_PROPERTY_QUERY (PropertyId @0, QueryType @4)
+        // with a STORAGE_PROTOCOL_SPECIFIC_DATA record in the
+        // additional-parameters overlay @8: ProtocolType 3 (NVMe)
+        // @8, DataType 2 (log page) @12, log identifier 02h @16,
+        // data offset 40 (from the record start) @24, length 512
+        // @28. The descriptor comes back in the same layout.
+        let mut query = [0u8; 48];
+        let put = |buf: &mut [u8; 48], off: usize, value: u32| {
+            buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut query, 0, STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY);
+        put(&mut query, 8, 3);
+        put(&mut query, 12, 2);
+        put(&mut query, 16, 2);
+        put(&mut query, 24, 40);
+        put(&mut query, 28, 512);
+        let mut out = vec![0u8; 560];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                query.as_ptr() as *const c_void,
+                query.len() as u32,
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 48 {
+            return None;
+        }
+        // Returned ProtocolDataOffset/Length sit at the same @24/@28;
+        // the log follows at 8 + offset. Trust them only in bounds.
+        let offset = u32::from_le_bytes([out[24], out[25], out[26], out[27]]) as usize;
+        let length = u32::from_le_bytes([out[28], out[29], out[30], out[31]]) as usize;
+        let start = 8usize.checked_add(offset)?;
+        let end = start.checked_add(length)?.min(out.len());
+        let slice = out.get(start..end)?;
+        parse_nvme_health_log(slice)
+    }
+
+    fn probe_disk_smart(handle: isize, index: u32) -> Option<DiskSmart> {
+        let raw = storage_query(handle, STORAGE_DEVICE_PROPERTY, 1024)?;
+        let desc = parse_storage_device_descriptor(&raw)?;
+        let interface = bus_type_name(desc.bus_type).to_string();
+        if desc.bus_type == 17 {
+            // BusTypeNvme.
+            if let Some(health) = nvme_health(handle) {
+                return Some(DiskSmart {
+                    index,
+                    interface,
+                    source: "nvme_health_log".to_string(),
+                    nvme: Some(health),
+                    ..Default::default()
+                });
+            }
+        } else if matches!(desc.bus_type, 2 | 3 | 11) {
+            // BusTypeAtapi / BusTypeAta / BusTypeSata: features
+            // 0xD0 = SMART READ DATA, 0xD1 = READ THRESHOLDS.
+            if let Some(data) = ata_smart_read(handle, index, 0xD0) {
+                let thresholds = ata_smart_read(handle, index, 0xD1);
+                let attrs = parse_ata_smart_attributes(&data, thresholds.as_deref());
+                if !attrs.is_empty() {
+                    return Some(DiskSmart {
+                        index,
+                        interface,
+                        source: "ata_smart".to_string(),
+                        ata_attributes: attrs,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        Some(DiskSmart {
+            index,
+            interface,
+            source: "none".to_string(),
+            ..Default::default()
+        })
+    }
+
+    pub fn smart_disks() -> CResult<Vec<DiskSmart>> {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x3;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE: isize = -1;
+        let mut out = Vec::new();
+        for index in 0..32u32 {
+            let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{index}")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            // SMART command paths historically want a read/write
+            // handle even though every command sent here only
+            // reads; degrade read-only, then zero-access (the
+            // storage descriptor still answers there, so the drive
+            // is at least listed with source "none").
+            let mut handle = INVALID_HANDLE;
+            for access in [GENERIC_READ | GENERIC_WRITE, GENERIC_READ, 0] {
+                handle = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        access,
+                        FILE_SHARE_READ_WRITE,
+                        std::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if handle != INVALID_HANDLE {
+                    break;
+                }
+            }
+            if handle == INVALID_HANDLE {
+                continue;
+            }
+            let disk = probe_disk_smart(handle, index);
             unsafe { CloseHandle(handle) };
             if let Some(disk) = disk {
                 out.push(disk);
@@ -1416,6 +1612,90 @@ mod win {
         Ok(out)
     }
 
+    fn secure_boot_capable_probe() -> Option<bool> {
+        // Reading a UEFI firmware variable needs
+        // SE_SYSTEM_ENVIRONMENT, which administrators hold
+        // disabled: enable it just for the call, restore it after.
+        // Without the privilege (the usual unelevated case) the
+        // capability is honestly unknown (None).
+        const TOKEN_ADJUST_PRIVILEGES_QUERY: u32 = 0x0028;
+        const SE_PRIVILEGE_ENABLED: u32 = 0x0002;
+        const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+        let mut token: isize = 0;
+        let opened = unsafe {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES_QUERY, &mut token)
+        };
+        if opened == 0 {
+            return None;
+        }
+        let name: Vec<u16> = "SeSystemEnvironmentPrivilege"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut luid = [0u8; 8];
+        let looked_up = unsafe {
+            LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), luid.as_mut_ptr())
+        };
+        if looked_up == 0 {
+            unsafe { CloseHandle(token) };
+            return None;
+        }
+        // TOKEN_PRIVILEGES: PrivilegeCount u32 @0, then one
+        // LUID_AND_ATTRIBUTES (Luid 8 bytes, Attributes u32).
+        let mut privileges = [0u8; 16];
+        privileges[0..4].copy_from_slice(&1u32.to_le_bytes());
+        privileges[4..12].copy_from_slice(&luid);
+        privileges[12..16].copy_from_slice(&SE_PRIVILEGE_ENABLED.to_le_bytes());
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                privileges.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // AdjustTokenPrivileges reports success even when the
+        // privilege was not held; the last-error says so.
+        if adjusted == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            unsafe { CloseHandle(token) };
+            return None;
+        }
+        let var_name: Vec<u16> = "SecureBoot"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let guid: Vec<u16> = "{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut value = [0u8; 8];
+        let got = unsafe {
+            GetFirmwareEnvironmentVariableW(
+                var_name.as_ptr(),
+                guid.as_ptr(),
+                value.as_mut_ptr() as *mut c_void,
+                value.len() as u32,
+            )
+        };
+        let last_error = if got == 0 { unsafe { GetLastError() } } else { 0 };
+        // Restore: same LUID with the attributes cleared.
+        privileges[12..16].copy_from_slice(&0u32.to_le_bytes());
+        unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                privileges.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { CloseHandle(token) };
+        secure_boot_capability(got != 0, last_error)
+    }
+
     // ---- platform readiness (kernel32 + registry + setupapi) ----
     pub fn platform_info() -> CResult<PlatformInfo> {
         let mut firmware: u32 = 0;
@@ -1431,6 +1711,13 @@ mod win {
         )
         .unwrap_or(0)
             == 1;
+        // Enabled implies capable; only the disabled case needs
+        // the firmware-variable probe (and its privilege).
+        let secure_boot_capable = if secure_boot_enabled {
+            Some(true)
+        } else {
+            secure_boot_capable_probe()
+        };
         let devices = class_device_names(&GUID_DEVCLASS_SECURITY);
         let tpm_device = devices
             .iter()
@@ -1440,6 +1727,7 @@ mod win {
         Ok(PlatformInfo {
             firmware_type: firmware_type.to_string(),
             secure_boot_enabled,
+            secure_boot_capable,
             tpm_present: !tpm_device.is_empty(),
             tpm_version: tpm_version_from_name(&tpm_device).to_string(),
             tpm_device,
@@ -1513,8 +1801,8 @@ mod win {
 
 #[cfg(not(windows))]
 use crate::{
-    AdapterInfo, BatteryHealth, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, GpuInfo, MemoryInfo,
-    MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
+    AdapterInfo, BatteryHealth, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, DiskSmart, GpuInfo,
+    MemoryInfo, MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
 };
 
 #[cfg(not(windows))]
@@ -1556,6 +1844,10 @@ pub fn board() -> CResult<BoardInfo> {
 #[cfg(not(windows))]
 pub fn physical_disks() -> CResult<Vec<PhysicalDiskInfo>> {
     not_supported("physical_disks")
+}
+#[cfg(not(windows))]
+pub fn smart_disks() -> CResult<Vec<DiskSmart>> {
+    not_supported("smart_disks")
 }
 #[cfg(not(windows))]
 pub fn ram_modules() -> CResult<Vec<RamModule>> {

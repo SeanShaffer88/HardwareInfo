@@ -21,14 +21,15 @@ doesn't need — and one probe's failure never poisons the others.
 | `hw_ram_json()` | Array of `{"slot","bank","manufacturer","part_number","serial","capacity_bytes","speed_mts","configured_speed_mts","type","form_factor","data_width_bits","total_width_bits"}` per installed module (SMBIOS). |
 | `hw_disks_json()` | Array of `{"letter","type","label","filesystem","total_bytes","free_bytes"}` per logical drive. |
 | `hw_physical_disks_json()` | Array of `{"index","model","vendor","revision","serial","interface","media","removable","size_bytes","health"}` per physical drive. |
+| `hw_smart_json()` | Array of `{"index","interface","source","ata_attributes":[{"id","name","flags","value","worst","threshold","raw"}],"nvme":{…}\|null}` per physical drive; `source` is `ata_smart`, `nvme_health_log`, or `none`. |
 | `hw_gpus_json()` | Array of `{"name","device","vendor_id","device_id","dedicated_video_memory_bytes","dedicated_system_memory_bytes","shared_system_memory_bytes","driver_version","luid"}` (mirroring drivers skipped). |
 | `hw_monitors_json()` | Array of `{"name","width","height","primary"}`. |
 | `hw_network_json()` | Array of `{"name","description","mac","type","up","ipv4":[],"ipv6":[]}`. |
 | `hw_battery_json()` | `{"present","ac_online","charging","percent"}` (−1 = unknown percentage). |
 | `hw_batteries_json()` | Array of `{"name","manufacturer","chemistry","rechargeable","designed_capacity_mwh","full_charge_capacity_mwh","health_percent","cycle_count"}` per battery device. |
 | `hw_board_json()` | `{"system_manufacturer","system_product","board_manufacturer","board_product","bios_vendor","bios_version","bios_date","system_version","system_serial","board_version","board_serial","system_uuid"}` |
-| `hw_platform_json()` | `{"firmware_type","secure_boot_enabled","tpm_present","tpm_version","tpm_device"}` |
-| `hw_system_json()` | All thirteen sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
+| `hw_platform_json()` | `{"firmware_type","secure_boot_enabled","secure_boot_capable","tpm_present","tpm_version","tpm_device"}` (`secure_boot_capable` is `true`/`false`/`null`). |
+| `hw_system_json()` | All fourteen sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
 | `hw_version*`, `hw_last_error*`, `hw_free_string` | Version info, thread-local errors, disposal. |
 
 ## How the data is gathered
@@ -54,7 +55,14 @@ doesn't need — and one probe's failure never poisons the others.
   `IOCTL_STORAGE_QUERY_PROPERTY`, total size from drive geometry,
   SSD/HDD from the seek-penalty descriptor, and the SMART
   failure-prediction verdict (`ok` / `failure_predicted` /
-  `unknown`). All query-only IOCTLs; drives that can't be opened
+  `unknown`). `hw_smart_json` goes deeper on the same handles:
+  ATA/SATA drives report their raw SMART attribute table
+  (SMART READ DATA/THRESHOLDS — receive-only commands; names only
+  for the small documented generic attribute set), NVMe drives
+  report the SMART/Health log page (temperature, spare,
+  percentage used, power-on hours, media errors), and anything
+  else is listed with `source:"none"`. All query-only IOCTLs;
+  drives that can't be opened
   are skipped (a zero-access fallback handle covers the
   unelevated case for the `FILE_ANY_ACCESS` queries).
 - **GPUs**: display adapters from `EnumDisplayDevices`, enriched
@@ -79,7 +87,10 @@ doesn't need — and one probe's failure never poisons the others.
   capacity is reported unknown).
 - **Platform readiness**: firmware mode from `GetFirmwareType`,
   Secure Boot state from the `SecureBoot\State` registry value
-  Windows itself maintains, and TPM presence/version from the
+  Windows itself maintains, Secure Boot *capability* from the
+  `SecureBoot` UEFI variable (the SE_SYSTEM_ENVIRONMENT privilege
+  is enabled just for that read; when it isn't grantable the field
+  is honestly `null`, never a guess), and TPM presence/version from the
   Security devices setup class (the description Windows reports,
   e.g. "Trusted Platform Module 2.0").
 
@@ -110,12 +121,16 @@ to missing fields, never to a guess.
   All extern blocks carry their `#[link(name = "...")]` (kernel32,
   user32, advapi32, iphlpapi, ntdll, dxgi, setupapi).
 
-Honest limits: reported values are what Windows reports. Disk
-health is the SMART failure-prediction verdict only, battery
-health is the capacities the battery itself reports, and the TPM
-version is the one its Windows device description states. Full
-SMART attribute tables and temperatures/voltages are not in v0.3
-(see ROADMAP).
+Honest limits: reported values are what the devices report.
+The physical-disk `health` is the SMART failure-prediction
+verdict only; SMART attribute meanings (and how `raw` is packed)
+are vendor-specific beyond the documented generic names;
+battery health is the capacities the battery itself reports;
+Secure Boot capability is `null` when it can't be determined
+without the privilege; and the TPM version is the one its
+Windows device description states. Temperatures/voltages beyond
+what a device itself reports (e.g. the NVMe log's temperature)
+are not in v0.4 (see ROADMAP).
 
 ## License
 

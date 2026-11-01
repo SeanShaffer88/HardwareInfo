@@ -13,9 +13,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::platform;
 use crate::{
-    adapters_json, batteries_json, disks_json, gpus_json, json_escape, monitors_json,
-    physical_disks_json, ram_json, ERR_INTERNAL, HW_OK, VERSION_MAJOR, VERSION_MINOR,
-    VERSION_PATCH,
+    adapters_json, batteries_json, disk_smart_json, disks_json, gpus_json, json_escape,
+    monitors_json, physical_disks_json, ram_json, ERR_INTERNAL, HW_OK, VERSION_MAJOR,
+    VERSION_MINOR, VERSION_PATCH,
 };
 
 thread_local! {
@@ -68,7 +68,7 @@ fn finish_str(run: Result<Result<String, (i32, String)>, (i32, String)>) -> *mut
 
 #[no_mangle]
 pub extern "C" fn hw_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.3.0\0";
+    static VERSION_C: &[u8] = b"0.4.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 
@@ -137,6 +137,11 @@ pub extern "C" fn hw_physical_disks_json() -> *mut c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn hw_smart_json() -> *mut c_char {
+    finish_str(guard(|| platform::smart_disks().map(|d| disk_smart_json(&d))))
+}
+
+#[no_mangle]
 pub extern "C" fn hw_ram_json() -> *mut c_char {
     finish_str(guard(|| platform::ram_modules().map(|m| ram_json(&m))))
 }
@@ -195,13 +200,14 @@ pub extern "C" fn hw_system_json() -> *mut c_char {
             return platform::not_supported("hardware probes");
         }
         Ok(format!(
-            "{{\"cpu\":{},\"os\":{},\"memory\":{},\"ram\":{},\"disks\":{},\"physical_disks\":{},\"gpus\":{},\"monitors\":{},\"network\":{},\"battery\":{},\"batteries\":{},\"board\":{},\"platform\":{}}}",
+            "{{\"cpu\":{},\"os\":{},\"memory\":{},\"ram\":{},\"disks\":{},\"physical_disks\":{},\"smart\":{},\"gpus\":{},\"monitors\":{},\"network\":{},\"battery\":{},\"batteries\":{},\"board\":{},\"platform\":{}}}",
             section(platform::cpu_info, |c| c.to_json()),
             section(platform::os_info, |o| o.to_json()),
             section(platform::memory_info, |m| m.to_json()),
             section(platform::ram_modules, |m| ram_json(&m)),
             section(platform::disks, |d| disks_json(&d)),
             section(platform::physical_disks, |d| physical_disks_json(&d)),
+            section(platform::smart_disks, |d| disk_smart_json(&d)),
             section(platform::gpus, |g| gpus_json(&g)),
             section(platform::monitors, |m| monitors_json(&m)),
             section(platform::adapters, |a| adapters_json(&a)),
@@ -226,6 +232,8 @@ mod tests {
             assert!(hw_cpu_json().is_null());
             assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
             assert!(hw_physical_disks_json().is_null());
+            assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
+            assert!(hw_smart_json().is_null());
             assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
             assert!(hw_ram_json().is_null());
             assert_eq!(hw_last_error_code(), crate::ERR_NOT_SUPPORTED);
