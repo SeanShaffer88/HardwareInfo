@@ -1,10 +1,10 @@
 [package]
 name = "hardwareinfo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Sean Shaffer"]
-description = "Hardware inventory behind one clean C ABI — CPU, GPU, memory, disks, monitors, network, battery"
+description = "Hardware inventory behind one clean C ABI — CPU, GPU, memory, RAM modules, logical + physical disks, monitors, network, battery"
 license = "MIT"
 repository = "https://github.com/SeanShaffer88/HardwareInfo"
 keywords = ["windows", "ffi"]

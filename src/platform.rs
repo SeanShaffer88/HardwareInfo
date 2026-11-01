@@ -27,9 +27,12 @@ pub use win::*;
 mod win {
     use std::ffi::c_void;
 
+    use crate::smbios;
     use crate::{
-        AdapterInfo, BatteryInfo, BoardInfo, CResult, CpuInfo, DiskInfo, GpuInfo, MemoryInfo,
-        MonitorInfo, OsInfo, ERR_PLATFORM,
+        bus_type_name, merge_dxgi_adapters, parse_disk_geometry_ex_size, parse_seek_penalty,
+        parse_storage_device_descriptor, AdapterInfo, BatteryInfo, BoardInfo, CResult, CpuInfo,
+        DiskInfo, DxgiAdapter, GpuInfo, MemoryInfo, MonitorInfo, OsInfo, PhysicalDiskInfo,
+        RamModule, ERR_PLATFORM,
     };
 
     // ---- registry (advapi32) ----
@@ -129,6 +132,35 @@ mod win {
         }
     }
 
+    fn reg_qword(root: isize, subkey: &str, name: &str) -> Option<u64> {
+        let sub: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let nm: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut key: isize = 0;
+        if unsafe { RegOpenKeyExW(root, sub.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            return None;
+        }
+        let mut data = [0u8; 8];
+        let mut size = 8u32;
+        let mut ty = 0u32;
+        let rc = unsafe {
+            RegQueryValueExW(
+                key,
+                nm.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                data.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        unsafe { RegCloseKey(key) };
+        if rc == 0 && ty == 11 {
+            // REG_QWORD
+            Some(u64::from_le_bytes(data))
+        } else {
+            None
+        }
+    }
+
     // ---- system info / memory / power (kernel32) ----
     #[link(name = "kernel32")]
     extern "system" {
@@ -156,6 +188,27 @@ mod win {
             total_free: *mut u64,
         ) -> i32;
         fn GetSystemPowerStatus(status: *mut PowerStatus) -> i32;
+        fn GetSystemFirmwareTable(sig: u32, id: u32, buf: *mut c_void, size: u32) -> u32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> isize;
+        fn DeviceIoControl(
+            handle: isize,
+            code: u32,
+            in_buf: *const c_void,
+            in_size: u32,
+            out_buf: *mut c_void,
+            out_size: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
     }
 
     #[repr(C)]
@@ -447,6 +500,187 @@ mod win {
         Ok(out)
     }
 
+    // ---- physical disks (kernel32 storage IOCTLs) ----
+    // Read-only query IOCTLs only: device descriptor, drive
+    // geometry, seek penalty, and the SMART failure-prediction
+    // verdict. Nothing here can write to the drive.
+    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+    const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D_1100;
+    const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
+    const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+    const STORAGE_DEVICE_PROPERTY: u32 = 0;
+    const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
+
+    fn storage_query(handle: isize, property: u32, out_size: usize) -> Option<Vec<u8>> {
+        // STORAGE_PROPERTY_QUERY: PropertyId u32, QueryType u32
+        // (0 = PropertyStandardQuery), AdditionalParameters[1].
+        let mut query = [0u8; 12];
+        query[0..4].copy_from_slice(&property.to_le_bytes());
+        let mut out = vec![0u8; out_size];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                query.as_ptr() as *const c_void,
+                query.len() as u32,
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned == 0 {
+            return None;
+        }
+        out.truncate((returned as usize).min(out.len()));
+        Some(out)
+    }
+
+    fn disk_size_bytes(handle: isize) -> u64 {
+        let mut geo = vec![0u8; 512];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                std::ptr::null(),
+                0,
+                geo.as_mut_ptr() as *mut c_void,
+                geo.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            if let Some(size) = parse_disk_geometry_ex_size(&geo) {
+                if size > 0 {
+                    return size;
+                }
+            }
+        }
+        // GET_LENGTH_INFO needs a read-access handle; best-effort.
+        let mut len_buf = [0u8; 8];
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_LENGTH_INFO,
+                std::ptr::null(),
+                0,
+                len_buf.as_mut_ptr() as *mut c_void,
+                len_buf.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            u64::from_le_bytes(len_buf)
+        } else {
+            0
+        }
+    }
+
+    fn disk_health(handle: isize) -> String {
+        // STORAGE_PREDICT_FAILURE: PredictFailure u32, then 512
+        // vendor-specific bytes we deliberately don't decode --
+        // the verdict is what Windows reports, nothing more.
+        let mut buf = vec![0u8; 516];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_PREDICT_FAILURE,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 4 {
+            return "unknown".to_string();
+        }
+        let predict = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if predict != 0 {
+            "failure_predicted".to_string()
+        } else {
+            "ok".to_string()
+        }
+    }
+
+    fn probe_physical_disk(handle: isize, index: u32) -> Option<PhysicalDiskInfo> {
+        let raw = storage_query(handle, STORAGE_DEVICE_PROPERTY, 1024)?;
+        let desc = parse_storage_device_descriptor(&raw)?;
+        let media = storage_query(handle, STORAGE_DEVICE_SEEK_PENALTY_PROPERTY, 32)
+            .and_then(|b| parse_seek_penalty(&b))
+            .map(|penalty| if penalty { "hdd" } else { "ssd" })
+            .unwrap_or("unknown");
+        Some(PhysicalDiskInfo {
+            index,
+            model: desc.product,
+            vendor: desc.vendor,
+            revision: desc.revision,
+            serial: desc.serial,
+            interface: bus_type_name(desc.bus_type).to_string(),
+            media: media.to_string(),
+            removable: desc.removable,
+            size_bytes: disk_size_bytes(handle),
+            health: disk_health(handle),
+        })
+    }
+
+    pub fn physical_disks() -> CResult<Vec<PhysicalDiskInfo>> {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x3;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE: isize = -1;
+        let mut out = Vec::new();
+        for index in 0..32u32 {
+            let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{index}")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            // Opening a physical drive for reading needs
+            // elevation; the storage queries are FILE_ANY_ACCESS,
+            // so fall back to a zero-access handle (size then
+            // comes from geometry, which is also FILE_ANY_ACCESS).
+            let mut handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE {
+                handle = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        0,
+                        FILE_SHARE_READ_WRITE,
+                        std::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+            if handle == INVALID_HANDLE {
+                continue;
+            }
+            let disk = probe_physical_disk(handle, index);
+            unsafe { CloseHandle(handle) };
+            if let Some(disk) = disk {
+                out.push(disk);
+            }
+        }
+        Ok(out)
+    }
+
     // ---- display devices & monitors (user32) ----
     #[link(name = "user32")]
     extern "system" {
@@ -491,6 +725,7 @@ mod win {
 
     pub fn gpus() -> CResult<Vec<GpuInfo>> {
         let mut out = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
         let mut i = 0u32;
         loop {
             let mut dd = DisplayDeviceW {
@@ -512,9 +747,148 @@ mod win {
             out.push(GpuInfo {
                 name: u16z(&dd.device_string),
                 device: u16z(&dd.device_name),
+                ..Default::default()
             });
+            keys.push(u16z(&dd.device_key));
+        }
+        // Enrichment is best-effort: DXGI memory/IDs matched by
+        // card name, driver version from the display device's
+        // registry key. A GPU Windows enumerates is reported
+        // either way (that's the v0.1 contract).
+        merge_dxgi_adapters(&mut out, &dxgi_adapters());
+        for (gpu, key) in out.iter_mut().zip(keys.iter()) {
+            let (version, vram) = driver_details(key);
+            gpu.driver_version = version;
+            if gpu.dedicated_video_memory_bytes == 0 {
+                gpu.dedicated_video_memory_bytes = vram;
+            }
         }
         Ok(out)
+    }
+
+    fn driver_details(device_key: &str) -> (String, u64) {
+        // EnumDisplayDevices reports the driver key in NT form
+        // (\Registry\Machine\...); the rest is HKLM-relative.
+        let subkey = device_key.strip_prefix("\\Registry\\Machine\\").unwrap_or("");
+        if subkey.is_empty() {
+            return (String::new(), 0);
+        }
+        let version = reg_string(HKEY_LOCAL_MACHINE, subkey, "DriverVersion").unwrap_or_default();
+        let vram = reg_qword(
+            HKEY_LOCAL_MACHINE,
+            subkey,
+            "HardwareInformation.qwMemorySize",
+        )
+        .unwrap_or(0);
+        (version, vram)
+    }
+
+    // ---- DXGI adapters (dxgi) ----
+    #[link(name = "dxgi")]
+    extern "system" {
+        fn CreateDXGIFactory1(riid: *const Guid, factory: *mut *mut c_void) -> i32;
+    }
+
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    // IID_IDXGIFactory1 = {770AAE78-F26F-4DBA-A829-253C83D1B387}
+    const IID_IDXGIFACTORY1: Guid = Guid {
+        data1: 0x770A_AE78,
+        data2: 0xF26F,
+        data3: 0x4DBA,
+        data4: [0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87],
+    };
+
+    // DXGI_ADAPTER_DESC1 (dxgi.h); AdapterLuid is read as one u64.
+    #[repr(C)]
+    struct DxgiAdapterDesc1Raw {
+        description: [u16; 128],
+        vendor_id: u32,
+        device_id: u32,
+        subsys_id: u32,
+        revision: u32,
+        dedicated_video_memory: usize,
+        dedicated_system_memory: usize,
+        shared_system_memory: usize,
+        adapter_luid: u64,
+        flags: u32,
+    }
+
+    /// Read one vtable slot as a typed fn pointer. Slot indices
+    /// follow C++ COM inheritance: IUnknown is 0 (QueryInterface),
+    /// 1 (AddRef), 2 (Release); IDXGIObject is 3-6; IDXGIFactory
+    /// is 7-11, so IDXGIFactory1::EnumAdapters1 is 12.
+    /// IDXGIAdapter is 7 (EnumOutputs), 8 (GetDesc),
+    /// 9 (CheckInterfaceSupport), so IDXGIAdapter1::GetDesc1 is
+    /// 10. Re-verify against dxgi.h before trusting a new slot.
+    ///
+    /// # Safety: `obj` is a live COM interface pointer whose
+    /// vtable slot `slot` holds a function of type `T`.
+    unsafe fn com_method<T>(obj: *mut c_void, slot: usize) -> T {
+        let vtbl = *(obj as *const *const usize);
+        let addr = *vtbl.add(slot);
+        std::mem::transmute_copy(&addr)
+    }
+
+    unsafe fn com_release(obj: *mut c_void) {
+        if !obj.is_null() {
+            let release: extern "system" fn(*mut c_void) -> u32 = com_method(obj, 2);
+            release(obj);
+        }
+    }
+
+    fn dxgi_adapters() -> Vec<DxgiAdapter> {
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        if unsafe { CreateDXGIFactory1(&IID_IDXGIFACTORY1, &mut factory) } < 0
+            || factory.is_null()
+        {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut i = 0u32;
+        loop {
+            let enum_adapters1: extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32 =
+                unsafe { com_method(factory, 12) };
+            let mut adapter: *mut c_void = std::ptr::null_mut();
+            // DXGI_ERROR_NOT_FOUND (a negative HRESULT) ends the
+            // enumeration.
+            if enum_adapters1(factory, i, &mut adapter) < 0 || adapter.is_null() {
+                break;
+            }
+            i += 1;
+            let get_desc1: extern "system" fn(*mut c_void, *mut DxgiAdapterDesc1Raw) -> i32 =
+                unsafe { com_method(adapter, 10) };
+            let mut desc: DxgiAdapterDesc1Raw = unsafe { std::mem::zeroed() };
+            let hr = get_desc1(adapter, &mut desc);
+            unsafe { com_release(adapter) };
+            if hr < 0 {
+                continue;
+            }
+            // Software adapters (Microsoft Basic Render) have no
+            // VRAM to report; the display-device list still
+            // carries the card itself.
+            const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
+            if desc.flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0 {
+                continue;
+            }
+            out.push(DxgiAdapter {
+                name: u16z(&desc.description),
+                vendor_id: desc.vendor_id,
+                device_id: desc.device_id,
+                dedicated_video_memory_bytes: desc.dedicated_video_memory as u64,
+                dedicated_system_memory_bytes: desc.dedicated_system_memory as u64,
+                shared_system_memory_bytes: desc.shared_system_memory as u64,
+                luid: desc.adapter_luid,
+            });
+        }
+        unsafe { com_release(factory) };
+        out
     }
 
     pub fn monitors() -> CResult<Vec<MonitorInfo>> {
@@ -731,10 +1105,39 @@ mod win {
         })
     }
 
+    // ---- SMBIOS firmware table (kernel32) ----
+    fn smbios_table() -> Option<Vec<u8>> {
+        const RSMB: u32 = 0x5253_4D42; // 'RSMB'
+        let size = unsafe { GetSystemFirmwareTable(RSMB, 0, std::ptr::null_mut(), 0) };
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let got = unsafe { GetSystemFirmwareTable(RSMB, 0, buf.as_mut_ptr() as *mut c_void, size) };
+        if got == 0 {
+            return None;
+        }
+        buf.truncate((got as usize).min(buf.len()));
+        smbios::raw_smbios_table(&buf).map(|table| table.to_vec())
+    }
+
+    pub fn ram_modules() -> CResult<Vec<RamModule>> {
+        match smbios_table() {
+            Some(table) => Ok(smbios::parse_ram_modules(&table)),
+            None => Err((ERR_PLATFORM, "SMBIOS firmware table unavailable".into())),
+        }
+    }
+
+    fn prefer_smbios(dst: &mut String, src: String) {
+        if !src.is_empty() {
+            *dst = src;
+        }
+    }
+
     pub fn board() -> CResult<BoardInfo> {
         let key = "HARDWARE\\DESCRIPTION\\System\\BIOS";
         let get = |name: &str| reg_string(HKEY_LOCAL_MACHINE, key, name).unwrap_or_default();
-        Ok(BoardInfo {
+        let mut info = BoardInfo {
             system_manufacturer: get("SystemManufacturer"),
             system_product: get("SystemProductName"),
             board_manufacturer: get("BaseBoardManufacturer"),
@@ -742,14 +1145,35 @@ mod win {
             bios_vendor: get("BIOSVendor"),
             bios_version: get("BIOSVersion"),
             bios_date: get("BIOSReleaseDate"),
-        })
+            ..Default::default()
+        };
+        // SMBIOS is the firmware record the registry key mirrors,
+        // so its non-empty values win and the registry fills any
+        // gaps (and carries the section alone when the firmware
+        // table can't be read).
+        if let Some(table) = smbios_table() {
+            let s = smbios::parse_board(&table);
+            prefer_smbios(&mut info.system_manufacturer, s.system_manufacturer);
+            prefer_smbios(&mut info.system_product, s.system_product);
+            prefer_smbios(&mut info.board_manufacturer, s.board_manufacturer);
+            prefer_smbios(&mut info.board_product, s.board_product);
+            prefer_smbios(&mut info.bios_vendor, s.bios_vendor);
+            prefer_smbios(&mut info.bios_version, s.bios_version);
+            prefer_smbios(&mut info.bios_date, s.bios_date);
+            prefer_smbios(&mut info.system_version, s.system_version);
+            prefer_smbios(&mut info.system_serial, s.system_serial);
+            prefer_smbios(&mut info.board_version, s.board_version);
+            prefer_smbios(&mut info.board_serial, s.board_serial);
+            prefer_smbios(&mut info.system_uuid, s.system_uuid);
+        }
+        Ok(info)
     }
 }
 
 #[cfg(not(windows))]
 use crate::{
     AdapterInfo, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, GpuInfo, MemoryInfo, MonitorInfo,
-    OsInfo,
+    OsInfo, PhysicalDiskInfo, RamModule,
 };
 
 #[cfg(not(windows))]
@@ -787,4 +1211,12 @@ pub fn battery() -> CResult<BatteryInfo> {
 #[cfg(not(windows))]
 pub fn board() -> CResult<BoardInfo> {
     not_supported("board")
+}
+#[cfg(not(windows))]
+pub fn physical_disks() -> CResult<Vec<PhysicalDiskInfo>> {
+    not_supported("physical_disks")
+}
+#[cfg(not(windows))]
+pub fn ram_modules() -> CResult<Vec<RamModule>> {
+    not_supported("ram_modules")
 }
