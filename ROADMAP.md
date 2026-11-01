@@ -2,19 +2,20 @@
 
 ## Next
 
-- **Platform readiness**: TPM presence/version, Secure Boot state,
-  firmware mode (UEFI/Legacy) — a natural "is this machine ready
-  for X" section to sit beside the inventory probes.
-- **Battery health**: designed vs full-charge capacity via the
-  battery device IOCTLs, beside the charge percentage v0.1 reports.
+- **Full SMART attribute tables**: raw attribute id/value/worst/
+  threshold per ATA drive plus the NVMe health log — v0.2 ships
+  the failure-prediction verdict only. Attribute meanings are
+  vendor-specific, so the design rule stays "raw reported values,
+  no invented labels beyond the documented generic set".
 
 ## Later
 
-- Full SMART attribute tables (v0.2 ships the failure-prediction
-  verdict only) — attribute meanings are vendor-specific, so this
-  needs a careful "raw values, no invented labels" design.
 - Temperatures/voltages are vendor-specific and often need a kernel
   driver — likely to stay out; will document rather than fake.
+- Secure Boot *capability* (vs currently-enabled state, v0.3) needs
+  the firmware environment variable, which requires the
+  SE_SYSTEM_ENVIRONMENT privilege — only if it can degrade
+  honestly unelevated.
 
 ## Non-goals
 

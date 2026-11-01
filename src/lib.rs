@@ -13,9 +13,9 @@ pub mod ffi;
 pub mod platform;
 pub mod smbios;
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.3.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_MINOR: u32 = 3;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/hardwareinfo.h).
@@ -172,6 +172,39 @@ pub struct RamModule {
     pub form_factor: String,
     pub data_width_bits: u32,
     pub total_width_bits: u32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PlatformInfo {
+    /// "uefi" / "bios" (legacy) / "unknown" from GetFirmwareType.
+    pub firmware_type: String,
+    /// UEFISecureBootEnabled from the SecureBoot\State registry key;
+    /// false when the key is absent (legacy firmware).
+    pub secure_boot_enabled: bool,
+    /// A Trusted Platform Module device is present (Security
+    /// devices setup class).
+    pub tpm_present: bool,
+    /// "2.0" / "1.2" when the device description states it, else "".
+    pub tpm_version: String,
+    /// The TPM device description Windows reports; empty if none.
+    pub tpm_device: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BatteryHealth {
+    pub name: String,
+    pub manufacturer: String,
+    /// Four-character chemistry code as reported, e.g. "LION".
+    pub chemistry: String,
+    pub rechargeable: bool,
+    /// 0 when the battery reports BATTERY_UNKNOWN_CAPACITY.
+    pub designed_capacity_mwh: u32,
+    /// 0 when the battery reports BATTERY_UNKNOWN_CAPACITY.
+    pub full_charge_capacity_mwh: u32,
+    /// full / designed * 100 from the reported capacities;
+    /// -1 when either capacity is unknown.
+    pub health_percent: i32,
+    pub cycle_count: u32,
 }
 
 pub fn json_escape(s: &str) -> String {
@@ -370,6 +403,39 @@ impl BatteryInfo {
     }
 }
 
+impl PlatformInfo {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"firmware_type\":{},\"secure_boot_enabled\":{},\"tpm_present\":{},\"tpm_version\":{},\"tpm_device\":{}}}",
+            q(&self.firmware_type),
+            self.secure_boot_enabled,
+            self.tpm_present,
+            q(&self.tpm_version),
+            q(&self.tpm_device)
+        )
+    }
+}
+
+pub fn batteries_json(batteries: &[BatteryHealth]) -> String {
+    let items: Vec<String> = batteries
+        .iter()
+        .map(|b| {
+            format!(
+                "{{\"name\":{},\"manufacturer\":{},\"chemistry\":{},\"rechargeable\":{},\"designed_capacity_mwh\":{},\"full_charge_capacity_mwh\":{},\"health_percent\":{},\"cycle_count\":{}}}",
+                q(&b.name),
+                q(&b.manufacturer),
+                q(&b.chemistry),
+                b.rechargeable,
+                b.designed_capacity_mwh,
+                b.full_charge_capacity_mwh,
+                b.health_percent,
+                b.cycle_count
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 impl BoardInfo {
     pub fn to_json(&self) -> String {
         format!(
@@ -388,6 +454,84 @@ impl BoardInfo {
             q(&self.system_uuid)
         )
     }
+}
+
+// ---- pure platform / battery helpers ----
+
+/// FIRMWARE_TYPE (winbase.h): 1 = legacy BIOS, 2 = UEFI.
+pub fn firmware_type_name(firmware_type: u32) -> &'static str {
+    match firmware_type {
+        1 => "bios",
+        2 => "uefi",
+        _ => "unknown",
+    }
+}
+
+/// TPM spec version stated by the device description Windows
+/// reports ("Trusted Platform Module 2.0"); "" when the
+/// description doesn't state one. Nothing is inferred beyond
+/// the text itself.
+pub fn tpm_version_from_name(device: &str) -> &'static str {
+    if device.contains("2.0") {
+        "2.0"
+    } else if device.contains("1.2") {
+        "1.2"
+    } else {
+        ""
+    }
+}
+
+/// The decoded BATTERY_INFORMATION fields this library reports.
+/// Capacities are 0 when the battery reports
+/// BATTERY_UNKNOWN_CAPACITY (0xFFFFFFFF).
+#[derive(Debug, Default, Clone)]
+pub struct BatteryInformationRaw {
+    pub chemistry: String,
+    pub rechargeable: bool,
+    pub designed_capacity_mwh: u32,
+    pub full_charge_capacity_mwh: u32,
+    pub cycle_count: u32,
+}
+
+/// BATTERY_INFORMATION layout (poclass.h): Capabilities u32@0,
+/// Technology u8@4, Chemistry[4]@8 (not necessarily
+/// NUL-terminated), DesignedCapacity u32@12,
+/// FullChargedCapacity u32@16, CycleCount u32@32; 36 bytes total.
+pub fn parse_battery_information(buf: &[u8]) -> Option<BatteryInformationRaw> {
+    if buf.len() < 36 {
+        return None;
+    }
+    const UNKNOWN_CAPACITY: u32 = 0xFFFF_FFFF;
+    let capacity = |off: usize| -> u32 {
+        match le_u32(buf, off) {
+            Some(UNKNOWN_CAPACITY) | None => 0,
+            Some(v) => v,
+        }
+    };
+    let chemistry_bytes = &buf[8..12];
+    let end = chemistry_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(chemistry_bytes.len());
+    Some(BatteryInformationRaw {
+        chemistry: String::from_utf8_lossy(&chemistry_bytes[..end])
+            .trim()
+            .to_string(),
+        rechargeable: buf[4] != 0,
+        designed_capacity_mwh: capacity(12),
+        full_charge_capacity_mwh: capacity(16),
+        cycle_count: le_u32(buf, 32).unwrap_or(0),
+    })
+}
+
+/// Wear level from the two reported capacities. A fresh battery
+/// can report slightly over 100; the value is reported as
+/// computed, not clamped. -1 when either capacity is unknown.
+pub fn battery_health_percent(designed_mwh: u32, full_mwh: u32) -> i32 {
+    if designed_mwh == 0 || full_mwh == 0 {
+        return -1;
+    }
+    ((full_mwh as u64 * 100) / designed_mwh as u64) as i32
 }
 
 // ---- pure storage-descriptor parsing (STORAGE_DEVICE_DESCRIPTOR) ----
@@ -673,5 +817,59 @@ mod tests {
         // No adapters at all leaves the v0.1 shape untouched.
         merge_dxgi_adapters(&mut gpus, &[]);
         assert_eq!(gpus[0].name, "Card X");
+    }
+
+    #[test]
+    fn platform_and_battery_helpers() {
+        assert_eq!(firmware_type_name(1), "bios");
+        assert_eq!(firmware_type_name(2), "uefi");
+        assert_eq!(firmware_type_name(0), "unknown");
+        assert_eq!(tpm_version_from_name("Trusted Platform Module 2.0"), "2.0");
+        assert_eq!(tpm_version_from_name("Trusted Platform Module 1.2"), "1.2");
+        assert_eq!(tpm_version_from_name("TPM"), "");
+        // Synthetic BATTERY_INFORMATION: LION, rechargeable,
+        // 56_000 mWh designed, 47_600 mWh full (85%), 312 cycles.
+        let mut buf = [0u8; 36];
+        buf[4] = 1;
+        buf[8..12].copy_from_slice(b"LION");
+        buf[12..16].copy_from_slice(&56_000u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&47_600u32.to_le_bytes());
+        buf[32..36].copy_from_slice(&312u32.to_le_bytes());
+        let raw = parse_battery_information(&buf).expect("battery info");
+        assert_eq!(raw.chemistry, "LION");
+        assert!(raw.rechargeable);
+        assert_eq!(raw.designed_capacity_mwh, 56_000);
+        assert_eq!(raw.cycle_count, 312);
+        assert_eq!(battery_health_percent(56_000, 47_600), 85);
+        assert_eq!(battery_health_percent(50_000, 52_500), 105);
+        assert_eq!(battery_health_percent(0, 47_600), -1);
+        // Unknown capacities read as 0, never 0xFFFFFFFF.
+        buf[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let raw = parse_battery_information(&buf).expect("battery info");
+        assert_eq!(raw.designed_capacity_mwh, 0);
+        assert!(parse_battery_information(&buf[..35]).is_none());
+        // JSON shapes.
+        let platform = PlatformInfo {
+            firmware_type: "uefi".into(),
+            secure_boot_enabled: true,
+            tpm_present: true,
+            tpm_version: "2.0".into(),
+            ..Default::default()
+        };
+        let j = platform.to_json();
+        assert!(j.contains("\"firmware_type\":\"uefi\""), "{j}");
+        assert!(j.contains("\"secure_boot_enabled\":true"), "{j}");
+        assert!(j.contains("\"tpm_version\":\"2.0\""), "{j}");
+        let batteries = vec![BatteryHealth {
+            name: "BAT0".into(),
+            chemistry: "LION".into(),
+            designed_capacity_mwh: 56_000,
+            full_charge_capacity_mwh: 47_600,
+            health_percent: 85,
+            ..Default::default()
+        }];
+        let j = batteries_json(&batteries);
+        assert!(j.contains("\"health_percent\":85"), "{j}");
+        assert!(j.contains("\"designed_capacity_mwh\":56000"), "{j}");
     }
 }

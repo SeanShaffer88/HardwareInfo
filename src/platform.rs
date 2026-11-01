@@ -29,10 +29,11 @@ mod win {
 
     use crate::smbios;
     use crate::{
-        bus_type_name, merge_dxgi_adapters, parse_disk_geometry_ex_size, parse_seek_penalty,
-        parse_storage_device_descriptor, AdapterInfo, BatteryInfo, BoardInfo, CResult, CpuInfo,
-        DiskInfo, DxgiAdapter, GpuInfo, MemoryInfo, MonitorInfo, OsInfo, PhysicalDiskInfo,
-        RamModule, ERR_PLATFORM,
+        battery_health_percent, bus_type_name, firmware_type_name, merge_dxgi_adapters,
+        parse_battery_information, parse_disk_geometry_ex_size, parse_seek_penalty,
+        parse_storage_device_descriptor, tpm_version_from_name, AdapterInfo, BatteryHealth,
+        BatteryInfo, BoardInfo, CResult, CpuInfo, DiskInfo, DxgiAdapter, GpuInfo, MemoryInfo,
+        MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule, ERR_PLATFORM,
     };
 
     // ---- registry (advapi32) ----
@@ -188,6 +189,7 @@ mod win {
             total_free: *mut u64,
         ) -> i32;
         fn GetSystemPowerStatus(status: *mut PowerStatus) -> i32;
+        fn GetFirmwareType(firmware_type: *mut u32) -> i32;
         fn GetSystemFirmwareTable(sig: u32, id: u32, buf: *mut c_void, size: u32) -> u32;
         fn CreateFileW(
             name: *const u16,
@@ -1106,6 +1108,344 @@ mod win {
         })
     }
 
+    // ---- device enumeration (setupapi) ----
+    #[link(name = "setupapi")]
+    extern "system" {
+        fn SetupDiGetClassDevsW(
+            class_guid: *const Guid,
+            enumerator: *const u16,
+            parent: *mut c_void,
+            flags: u32,
+        ) -> isize;
+        fn SetupDiEnumDeviceInterfaces(
+            devs: isize,
+            dev_info: *mut c_void,
+            guid: *const Guid,
+            index: u32,
+            data: *mut u8,
+        ) -> i32;
+        fn SetupDiGetDeviceInterfaceDetailW(
+            devs: isize,
+            data: *mut u8,
+            detail: *mut u8,
+            detail_size: u32,
+            required: *mut u32,
+            dev_info: *mut c_void,
+        ) -> i32;
+        fn SetupDiEnumDeviceInfo(devs: isize, index: u32, data: *mut u8) -> i32;
+        fn SetupDiGetDeviceRegistryPropertyW(
+            devs: isize,
+            data: *mut u8,
+            property: u32,
+            data_type: *mut u32,
+            buffer: *mut u8,
+            buffer_size: u32,
+            required: *mut u32,
+        ) -> i32;
+        fn SetupDiDestroyDeviceInfoList(devs: isize) -> i32;
+    }
+
+    const DIGCF_PRESENT: u32 = 0x2;
+    const DIGCF_DEVICEINTERFACE: u32 = 0x10;
+    // GUID_DEVINTERFACE_BATTERY {72631E54-78A4-11D0-BCF7-00AA00B7B32A}
+    const GUID_DEVINTERFACE_BATTERY: Guid = Guid {
+        data1: 0x7263_1E54,
+        data2: 0x78A4,
+        data3: 0x11D0,
+        data4: [0xBC, 0xF7, 0x00, 0xAA, 0x00, 0xB7, 0xB3, 0x2A],
+    };
+    // Security devices setup class {D94EE5D8-D189-4994-83D2-F68D7D41B0E6}
+    const GUID_DEVCLASS_SECURITY: Guid = Guid {
+        data1: 0xD94E_E5D8,
+        data2: 0xD189,
+        data3: 0x4994,
+        data4: [0x83, 0xD2, 0xF6, 0x8D, 0x7D, 0x41, 0xB0, 0xE6],
+    };
+
+    fn wide_string_from_bytes(buf: &[u8]) -> String {
+        let units: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    }
+
+    /// Device-interface paths for one interface class, via SetupDi.
+    /// SP_DEVICE_INTERFACE_DATA is handled as a byte buffer with
+    /// cbSize 32 (its 64-bit size); the detail record carries the
+    /// path as WCHARs at offset 4, and its cbSize must be 8 for
+    /// the W variant on 64-bit. Failures keep the paths gathered
+    /// so far -- enumeration is best-effort.
+    fn device_interface_paths(guid: &Guid) -> Vec<String> {
+        let mut paths = Vec::new();
+        let devs = unsafe {
+            SetupDiGetClassDevsW(
+                guid,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            )
+        };
+        if devs == -1 {
+            return paths;
+        }
+        let mut index = 0u32;
+        loop {
+            let mut data = [0u8; 32];
+            data[0..4].copy_from_slice(&32u32.to_le_bytes());
+            let ok = unsafe {
+                SetupDiEnumDeviceInterfaces(
+                    devs,
+                    std::ptr::null_mut(),
+                    guid,
+                    index,
+                    data.as_mut_ptr(),
+                )
+            };
+            index += 1;
+            if ok == 0 {
+                break;
+            }
+            let mut required: u32 = 0;
+            unsafe {
+                SetupDiGetDeviceInterfaceDetailW(
+                    devs,
+                    data.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut required,
+                    std::ptr::null_mut(),
+                )
+            };
+            if required >= 6 {
+                let mut detail = vec![0u8; required as usize];
+                detail[0..4].copy_from_slice(&8u32.to_le_bytes());
+                let ok = unsafe {
+                    SetupDiGetDeviceInterfaceDetailW(
+                        devs,
+                        data.as_mut_ptr(),
+                        detail.as_mut_ptr(),
+                        required,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok != 0 {
+                    paths.push(wide_string_from_bytes(&detail[4..]));
+                }
+            }
+            if index > 64 {
+                break;
+            }
+        }
+        unsafe { SetupDiDestroyDeviceInfoList(devs) };
+        paths
+    }
+
+    /// Friendly-name (fallback: device-description) strings for
+    /// every present device in one setup class. SP_DEVINFO_DATA
+    /// cbSize is 32 on 64-bit Windows.
+    fn class_device_names(guid: &Guid) -> Vec<String> {
+        const SPDRP_DEVICEDESC: u32 = 0x0;
+        const SPDRP_FRIENDLYNAME: u32 = 0x0C;
+        let mut names = Vec::new();
+        let devs = unsafe {
+            SetupDiGetClassDevsW(guid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT)
+        };
+        if devs == -1 {
+            return names;
+        }
+        let mut index = 0u32;
+        loop {
+            let mut data = [0u8; 32];
+            data[0..4].copy_from_slice(&32u32.to_le_bytes());
+            if unsafe { SetupDiEnumDeviceInfo(devs, index, data.as_mut_ptr()) } == 0 {
+                break;
+            }
+            index += 1;
+            for property in [SPDRP_FRIENDLYNAME, SPDRP_DEVICEDESC] {
+                let mut buf = vec![0u8; 512];
+                let mut required: u32 = 0;
+                let ok = unsafe {
+                    SetupDiGetDeviceRegistryPropertyW(
+                        devs,
+                        data.as_mut_ptr(),
+                        property,
+                        std::ptr::null_mut(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        &mut required,
+                    )
+                };
+                if ok != 0 {
+                    let name = wide_string_from_bytes(&buf);
+                    if !name.is_empty() {
+                        names.push(name);
+                        break;
+                    }
+                }
+            }
+            if index > 64 {
+                break;
+            }
+        }
+        unsafe { SetupDiDestroyDeviceInfoList(devs) };
+        names
+    }
+
+    // ---- battery health (battery device IOCTLs) ----
+    // Query IOCTLs only, like everything else in this library.
+    const IOCTL_BATTERY_QUERY_TAG: u32 = 0x0029_4040;
+    const IOCTL_BATTERY_QUERY_INFORMATION: u32 = 0x0029_4044;
+
+    fn battery_query_string(handle: isize, tag: u32, level: u32) -> String {
+        // BATTERY_QUERY_INFORMATION: BatteryTag u32, level u32,
+        // AtRate u32. String levels: DeviceName 4, ManufactureName 6.
+        let mut query = [0u8; 12];
+        query[0..4].copy_from_slice(&tag.to_le_bytes());
+        query[4..8].copy_from_slice(&level.to_le_bytes());
+        let mut out = vec![0u8; 512];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_BATTERY_QUERY_INFORMATION,
+                query.as_ptr() as *const c_void,
+                query.len() as u32,
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return String::new();
+        }
+        wide_string_from_bytes(&out).trim().to_string()
+    }
+
+    fn probe_battery(handle: isize) -> Option<BatteryHealth> {
+        // The tag changes whenever the battery is swapped, so query
+        // it fresh instead of trusting a cached value. The input
+        // is a timeout in ms; 0 polls.
+        let timeout: u32 = 0;
+        let mut tag_buf = [0u8; 4];
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_BATTERY_QUERY_TAG,
+                &timeout as *const u32 as *const c_void,
+                4,
+                tag_buf.as_mut_ptr() as *mut c_void,
+                tag_buf.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 4 {
+            return None;
+        }
+        let tag = u32::from_le_bytes(tag_buf);
+        if tag == 0 {
+            return None;
+        }
+        let mut query = [0u8; 12];
+        query[0..4].copy_from_slice(&tag.to_le_bytes());
+        // Level 0 (BatteryInformation), AtRate 0.
+        let mut out = [0u8; 64];
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_BATTERY_QUERY_INFORMATION,
+                query.as_ptr() as *const c_void,
+                query.len() as u32,
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 36 {
+            return None;
+        }
+        let raw = parse_battery_information(&out)?;
+        Some(BatteryHealth {
+            name: battery_query_string(handle, tag, 4),
+            manufacturer: battery_query_string(handle, tag, 6),
+            health_percent: battery_health_percent(
+                raw.designed_capacity_mwh,
+                raw.full_charge_capacity_mwh,
+            ),
+            chemistry: raw.chemistry,
+            rechargeable: raw.rechargeable,
+            designed_capacity_mwh: raw.designed_capacity_mwh,
+            full_charge_capacity_mwh: raw.full_charge_capacity_mwh,
+            cycle_count: raw.cycle_count,
+        })
+    }
+
+    pub fn batteries() -> CResult<Vec<BatteryHealth>> {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x3;
+        const OPEN_EXISTING: u32 = 3;
+        let mut out = Vec::new();
+        for path in device_interface_paths(&GUID_DEVINTERFACE_BATTERY) {
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == -1 {
+                continue;
+            }
+            let battery = probe_battery(handle);
+            unsafe { CloseHandle(handle) };
+            if let Some(battery) = battery {
+                out.push(battery);
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- platform readiness (kernel32 + registry + setupapi) ----
+    pub fn platform_info() -> CResult<PlatformInfo> {
+        let mut firmware: u32 = 0;
+        let firmware_type = if unsafe { GetFirmwareType(&mut firmware) } != 0 {
+            firmware_type_name(firmware)
+        } else {
+            "unknown"
+        };
+        let secure_boot_enabled = reg_dword(
+            HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+            "UEFISecureBootEnabled",
+        )
+        .unwrap_or(0)
+            == 1;
+        let devices = class_device_names(&GUID_DEVCLASS_SECURITY);
+        let tpm_device = devices
+            .iter()
+            .find(|name| name.contains("Trusted Platform Module") || name.contains("TPM"))
+            .cloned()
+            .unwrap_or_default();
+        Ok(PlatformInfo {
+            firmware_type: firmware_type.to_string(),
+            secure_boot_enabled,
+            tpm_present: !tpm_device.is_empty(),
+            tpm_version: tpm_version_from_name(&tpm_device).to_string(),
+            tpm_device,
+        })
+    }
+
     // ---- SMBIOS firmware table (kernel32) ----
     fn smbios_table() -> Option<Vec<u8>> {
         const RSMB: u32 = 0x5253_4D42; // 'RSMB'
@@ -1173,8 +1513,8 @@ mod win {
 
 #[cfg(not(windows))]
 use crate::{
-    AdapterInfo, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, GpuInfo, MemoryInfo, MonitorInfo,
-    OsInfo, PhysicalDiskInfo, RamModule,
+    AdapterInfo, BatteryHealth, BatteryInfo, BoardInfo, CpuInfo, DiskInfo, GpuInfo, MemoryInfo,
+    MonitorInfo, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
 };
 
 #[cfg(not(windows))]
@@ -1220,4 +1560,12 @@ pub fn physical_disks() -> CResult<Vec<PhysicalDiskInfo>> {
 #[cfg(not(windows))]
 pub fn ram_modules() -> CResult<Vec<RamModule>> {
     not_supported("ram_modules")
+}
+#[cfg(not(windows))]
+pub fn batteries() -> CResult<Vec<BatteryHealth>> {
+    not_supported("batteries")
+}
+#[cfg(not(windows))]
+pub fn platform_info() -> CResult<PlatformInfo> {
+    not_supported("platform_info")
 }

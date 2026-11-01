@@ -1,8 +1,9 @@
 # HardwareInfo
 
 A hardware inventory of the machine — CPU, OS, memory, RAM modules,
-logical + physical disks, GPUs, monitors, network adapters, battery,
-motherboard/BIOS — as structured JSON behind one clean C ABI. Pure
+logical + physical disks, GPUs, monitors, network adapters, battery
+(+ wear), motherboard/BIOS, platform readiness (TPM / Secure Boot /
+firmware mode) — as structured JSON behind one clean C ABI. Pure
 Rust, zero dependencies, hand-declared Win32 bindings. Library #8 in
 the Windows DLL Collection.
 
@@ -24,8 +25,10 @@ doesn't need — and one probe's failure never poisons the others.
 | `hw_monitors_json()` | Array of `{"name","width","height","primary"}`. |
 | `hw_network_json()` | Array of `{"name","description","mac","type","up","ipv4":[],"ipv6":[]}`. |
 | `hw_battery_json()` | `{"present","ac_online","charging","percent"}` (−1 = unknown percentage). |
+| `hw_batteries_json()` | Array of `{"name","manufacturer","chemistry","rechargeable","designed_capacity_mwh","full_charge_capacity_mwh","health_percent","cycle_count"}` per battery device. |
 | `hw_board_json()` | `{"system_manufacturer","system_product","board_manufacturer","board_product","bios_vendor","bios_version","bios_date","system_version","system_serial","board_version","board_serial","system_uuid"}` |
-| `hw_system_json()` | All eleven sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
+| `hw_platform_json()` | `{"firmware_type","secure_boot_enabled","tpm_present","tpm_version","tpm_device"}` |
+| `hw_system_json()` | All thirteen sections in one object; on Windows a failed section appears as `{"error": "…"}` in place of its data. |
 | `hw_version*`, `hw_last_error*`, `hw_free_string` | Version info, thread-local errors, disposal. |
 
 ## How the data is gathered
@@ -67,6 +70,18 @@ doesn't need — and one probe's failure never poisons the others.
   including serials and the system UUID; the registry BIOS key —
   the same data firmware reports to Windows — fills any gaps and
   carries the section alone when the firmware table is unreadable.
+- **Batteries**: per-device wear data from the battery class
+  driver — devices enumerated with SetupDi
+  (`GUID_DEVINTERFACE_BATTERY`), then `IOCTL_BATTERY_QUERY_TAG` +
+  `IOCTL_BATTERY_QUERY_INFORMATION` for designed vs full-charge
+  capacity (mWh), cycle count, chemistry, name, and manufacturer.
+  `health_percent` is the plain full/designed ratio (−1 when a
+  capacity is reported unknown).
+- **Platform readiness**: firmware mode from `GetFirmwareType`,
+  Secure Boot state from the `SecureBoot\State` registry value
+  Windows itself maintains, and TPM presence/version from the
+  Security devices setup class (the description Windows reports,
+  e.g. "Trusted Platform Module 2.0").
 
 Struct layouts and linked-list offsets (SYSTEM_INFO, the adapter
 chain, SMBIOS structures, the storage descriptor) are used only
@@ -79,26 +94,28 @@ to missing fields, never to a guess.
 
 - Unit tests cover the JSON shapes and escaping, the pure parsers
   (synthetic SMBIOS tables, storage descriptor, seek-penalty and
-  geometry buffers, DXGI name matching), and the off-Windows
-  contract (every probe is a precise `NOT_SUPPORTED`) — all
-  runnable on any OS.
+  geometry buffers, DXGI name matching, BATTERY_INFORMATION and
+  the health-ratio math), and the off-Windows contract (every
+  probe is a precise `NOT_SUPPORTED`) — all runnable on any OS.
 - **CI (`tests/roundtrip.rs`, Windows)**: runs every probe against
   the CI machine and asserts the invariants that hold on any real
   Windows box — a named CPU with ≥1 logical processor, a Windows OS
   with a real build number, nonzero physical memory, a `C:` drive
   with capacity, a `PhysicalDrive0` with nonzero size, populated
   RAM modules with real capacity, well-formed arrays for
-  GPU/monitor/network, and a system document containing all
-  sections.
+  GPU/monitor/network/batteries, a platform section, and a system
+  document containing all sections.
 - Gate (WinDevKit `tools/gate.sh`): fmt, clippy on host **and**
   `x86_64-pc-windows-msvc` with `-D warnings`, full tests — green.
   All extern blocks carry their `#[link(name = "...")]` (kernel32,
-  user32, advapi32, iphlpapi, ntdll, dxgi).
+  user32, advapi32, iphlpapi, ntdll, dxgi, setupapi).
 
 Honest limits: reported values are what Windows reports. Disk
-health is the SMART failure-prediction verdict only — full
-attribute tables, temperatures/voltages, and battery wear are not
-in v0.2 (see ROADMAP).
+health is the SMART failure-prediction verdict only, battery
+health is the capacities the battery itself reports, and the TPM
+version is the one its Windows device description states. Full
+SMART attribute tables and temperatures/voltages are not in v0.3
+(see ROADMAP).
 
 ## License
 

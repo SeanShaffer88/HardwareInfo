@@ -43,7 +43,9 @@ HW_API char *hw_gpus_json(void);    /* display adapters + DXGI memory/IDs, drive
 HW_API char *hw_monitors_json(void);/* monitors: name, size, primary */
 HW_API char *hw_network_json(void); /* adapters: name, MAC, type, state, IPs */
 HW_API char *hw_battery_json(void); /* present, AC, charging, percent */
+HW_API char *hw_batteries_json(void); /* per battery: chemistry, designed vs full mWh, health %, cycles */
 HW_API char *hw_board_json(void);   /* system + baseboard + BIOS identity, serials, UUID (SMBIOS) */
+HW_API char *hw_platform_json(void); /* firmware type (UEFI/BIOS), Secure Boot, TPM presence/version */
 
 /* Everything at once; failed sections appear as {"error": ...}. */
 HW_API char *hw_system_json(void);
