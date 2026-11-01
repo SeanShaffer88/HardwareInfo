@@ -34,8 +34,7 @@ mod win {
         parse_nvme_health_log, parse_seek_penalty, parse_storage_device_descriptor,
         secure_boot_capability, tpm_version_from_name, AdapterInfo, BatteryHealth, BatteryInfo,
         BoardInfo, CResult, CpuInfo, DiskInfo, DiskSmart, DxgiAdapter, GpuInfo, MemoryInfo,
-        MonitorInfo, NvmeHealth, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule,
-        ERR_PLATFORM,
+        MonitorInfo, NvmeHealth, OsInfo, PhysicalDiskInfo, PlatformInfo, RamModule, ERR_PLATFORM,
     };
 
     // ---- registry + token privileges (advapi32) ----
@@ -1623,7 +1622,11 @@ mod win {
         const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
         let mut token: isize = 0;
         let opened = unsafe {
-            OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES_QUERY, &mut token)
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES_QUERY,
+                &mut token,
+            )
         };
         if opened == 0 {
             return None;
@@ -1633,9 +1636,8 @@ mod win {
             .chain(std::iter::once(0))
             .collect();
         let mut luid = [0u8; 8];
-        let looked_up = unsafe {
-            LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), luid.as_mut_ptr())
-        };
+        let looked_up =
+            unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), luid.as_mut_ptr()) };
         if looked_up == 0 {
             unsafe { CloseHandle(token) };
             return None;
@@ -1679,7 +1681,11 @@ mod win {
                 value.len() as u32,
             )
         };
-        let last_error = if got == 0 { unsafe { GetLastError() } } else { 0 };
+        let last_error = if got == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
         // Restore: same LUID with the attributes cleared.
         privileges[12..16].copy_from_slice(&0u32.to_le_bytes());
         unsafe {

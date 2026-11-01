@@ -733,10 +733,7 @@ fn smart_threshold(thresholds: &[u8], id: u8) -> u32 {
 /// 48-bit little-endian, reserved u8). Slots with id 0 are
 /// unused and skipped. `thresholds`, when present, is the
 /// matching SMART READ THRESHOLDS block.
-pub fn parse_ata_smart_attributes(
-    data: &[u8],
-    thresholds: Option<&[u8]>,
-) -> Vec<SmartAttribute> {
+pub fn parse_ata_smart_attributes(data: &[u8], thresholds: Option<&[u8]>) -> Vec<SmartAttribute> {
     let mut out = Vec::new();
     for slot in 0..30usize {
         let off = 2 + slot * 12;
@@ -784,11 +781,7 @@ pub fn parse_nvme_health_log(buf: &[u8]) -> Option<NvmeHealth> {
     Some(NvmeHealth {
         critical_warning: buf[0] as u32,
         temperature_kelvin: kelvin,
-        temperature_celsius: if kelvin == 0 {
-            0
-        } else {
-            kelvin as i32 - 273
-        },
+        temperature_celsius: if kelvin == 0 { 0 } else { kelvin as i32 - 273 },
         available_spare_percent: buf[3] as u32,
         available_spare_threshold_percent: buf[4] as u32,
         percentage_used: buf[5] as u32,
@@ -1153,7 +1146,7 @@ mod tests {
     #[test]
     fn smart_parsing() {
         // Synthetic SMART block: id 9 power-on-hours raw 12345,
-        // id 194 temperature, one empty slot, one vendor id 0xF1.
+        // id 194 temperature, one empty slot, one unnamed vendor id 230.
         let mut data = [0u8; 512];
         let mut put_attr = |slot: usize, id: u8, value: u8, worst: u8, raw: u64| {
             let off = 2 + slot * 12;
@@ -1165,7 +1158,7 @@ mod tests {
         };
         put_attr(0, 9, 98, 98, 12345);
         put_attr(2, 194, 70, 60, 30);
-        put_attr(3, 0xF1, 100, 100, 7);
+        put_attr(3, 0xE6, 100, 100, 7);
         let mut thresholds = [0u8; 512];
         thresholds[2] = 9;
         thresholds[3] = 1;

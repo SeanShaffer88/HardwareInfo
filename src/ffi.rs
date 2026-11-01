@@ -138,7 +138,9 @@ pub extern "C" fn hw_physical_disks_json() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn hw_smart_json() -> *mut c_char {
-    finish_str(guard(|| platform::smart_disks().map(|d| disk_smart_json(&d))))
+    finish_str(guard(|| {
+        platform::smart_disks().map(|d| disk_smart_json(&d))
+    }))
 }
 
 #[no_mangle]
